@@ -1,3 +1,4 @@
+#ifndef MPU9250_H
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -41,9 +42,64 @@ using std::min;
 #define TAG_MPU "MPU9250"
 #define LOG_LEVEL ESP_LOG_INFO
 
+// --------------------------------------------------------------------------------
+// MPU9250 Class
+// --------------------------------------------------------------------------------
+// This class handles the initialization, calibration, and data retrieval from the MPU9250
+// and AK8963 sensors (Magnetometer in MPU9250). It also provides methods for orientation calculation and sensor health monitoring.
+//
+// The class uses FreeRTOS for task management and synchronization.
+// It supports both complementary and Mahony filter algorithms for orientation estimation.
+// The class also includes calibration routines for accelerometer, gyroscope, and magnetometer.
+// The calibration process is performed in the background and can be monitored through the `getCalibrationStatus` method.
+// The class provides methods to retrieve the current orientation, accelerometer, gyroscope, and magnetometer readings.
+// The orientation is represented as roll, pitch, and yaw angles in degrees.
+// The accelerometer, gyroscope, and magnetometer readings are represented as 3D vectors.
+// The class also includes a health monitoring feature that tracks the number of successful and failed sensor readings.
+// The health status can be checked using the `isSensorHealthy` method.
+// The class is designed to be used with ESP-IDF framework and requires the I2C driver for communication with the sensors.
+// TO USE THIS CLASS:
+// 1. Include the header file in your project.
+// 2. Create an instance of the MPU9250 class.
+// 3. Call the `init` method to initialize the I2C communication and sensors.
+// 4. Start the sensor task using the `startSensorTask` method.
+// 5. Optionally, call the `calibrate` method to perform calibration.
+// 6. Use the `getOrientation`, `getAccel`, `getGyro`, and `getMag` methods to retrieve sensor data.
+// 7. Monitor the calibration status and health status using `getCalibrationStatus` and `isSensorHealthy` methods.
+// 8. Stop the sensor task and clean up resources when done.
+//
+// Example usage:
+// extern "C" void app_main() {
+//     static MPU9250 imu;
+
+//     esp_err_t err = imu.init(I2C_NUM_0, GPIO_NUM_21, GPIO_NUM_22);  // Set appropriate SDA/SCL pins
+//     if (err != ESP_OK) {
+//         ESP_LOGE("APP", "Failed to initialize MPU9250");
+//         return;
+//     }
+
+//     ESP_LOGI("APP", "MPU9250 initialized");
+
+//     err = imu.calibrate();
+//     if (err != ESP_OK) {
+//         ESP_LOGE("APP", "Failed to start calibration");
+//         return;
+//     }
+
+//     err = imu.startSensorTask();  // Assuming this creates a FreeRTOS task for reading sensor data
+//     if (err != ESP_OK) {
+//         ESP_LOGE("APP", "Failed to start sensor task");
+//         return;
+//     }
+// }
+// --------------------------------------------------------------------------------
 class MPU9250
 {
 public:
+    // Sensor Data Structures
+    // These structures are used to represent the sensor data and orientation.
+
+    // The `Orientation` structure contains roll, pitch, and yaw angles in degrees.
     struct Orientation
     {
         float roll;
@@ -51,6 +107,8 @@ public:
         float yaw;
     };
 
+    // The `Vector3` structure represents a 3D vector with x, y, and z components.
+    // It is used to represent accelerometer, gyroscope, and magnetometer readings.
     struct Vector3
     {
         float x;
@@ -58,6 +116,11 @@ public:
         float z;
     };
 
+    // The `CalibrationStatus` enum represents the calibration status of the sensor.
+    // It can be one of the following values:
+    // - NOT_CALIBRATED: The sensor is not calibrated.
+    // - CALIBRATING: The sensor is currently being calibrated.
+    // - CALIBRATED: The sensor has been calibrated successfully.
     enum CalibrationStatus
     {
         NOT_CALIBRATED,
@@ -65,18 +128,69 @@ public:
         CALIBRATED
     };
 
+    // Constructor and Destructor
     MPU9250();
     ~MPU9250();
 
+    // Public Methods
+    // These methods are used to initialize the sensor, start the sensor task, perform calibration,
+    // retrieve sensor data, and check the sensor health status.
+
+    // The `init` method initializes the I2C communication and configures the sensor.
+    // It takes the I2C port number, SDA pin number, and SCL pin number as parameters.
+    // It returns an ESP error code indicating the success or failure of the initialization.
     esp_err_t init(i2c_port_t i2cPort, uint8_t sdaPin, uint8_t sclPin);
+
+    // The `startSensorTask` method starts the sensor task, which continuously reads sensor data
+    // and processes it in the background. It returns an ESP error code indicating the success or failure.
+    // The task runs in a FreeRTOS environment and uses a mutex for synchronization.
+    // The task is responsible for reading sensor data, applying filters, and updating the orientation.
+    // The task also handles calibration and health monitoring.
+    // The task runs at a specified frequency, which can be adjusted in the implementation.
     esp_err_t startSensorTask();
+
+    // The `calibrate` method performs calibration of the accelerometer, gyroscope, and magnetometer.
+    // It collects a specified number of samples and computes the offsets for each sensor.
+    // The calibration process is performed in the background and can take some time.
+    // The method returns an ESP error code indicating the success or failure of the calibration.
+    // The calibration status can be monitored using the `getCalibrationStatus` method.
     esp_err_t calibrate();
+
+    // The `getOrientation` method retrieves the current orientation of the sensor.
+    // It returns an `Orientation` structure containing the roll, pitch, and yaw angles in degrees.
+    // The angles are computed using the complementary or Mahony filter, depending on the filter mode.
+    // The roll angle represents the rotation around the x-axis, the pitch angle represents the rotation around the y-axis,
+    // and the yaw angle represents the rotation around the z-axis.
     Orientation getOrientation();
+
+    // The `getAccel`, `getGyro`, and `getMag` methods retrieve the current accelerometer, gyroscope, and magnetometer readings.
+    // They return `Vector3` structures containing the x, y, and z components of the respective sensor data.
+    // The accelerometer readings are in g (gravitational units), the gyroscope readings are in degrees per second,
+    // and the magnetometer readings are in microteslas (µT).
+
     Vector3 getAccel();
     Vector3 getGyro();
     Vector3 getMag();
+
+    // The `getTemperature` method retrieves the current temperature reading from the sensor.
+    // It returns the temperature in degrees Celsius.
+    // The temperature is measured by the internal temperature sensor of the MPU9250.
+    // The temperature reading can be used for compensation in some applications.
+    // The temperature is not used for orientation calculation but can be useful for monitoring the sensor's operating conditions.
     float getTemperature();
+
+    // The `isSensorHealthy` method checks the health status of the sensor.
+    // It returns true if the sensor is healthy and able to provide valid readings,
+    // and false if there are issues with the sensor communication or data retrieval.
+    // The health status is monitored by counting the number of successful and failed sensor readings.
+    // The method can be used to detect sensor malfunctions or communication errors.
+    // The health status can be used to trigger error handling or fallback mechanisms in the application.
+    // The method can also be used to check if the sensor is ready for use after initialization or calibration.
     bool isSensorHealthy();
+
+    // The `getCalibrationStatus` method retrieves the current calibration status of the sensor.
+    // It returns a `CalibrationStatus` enum value indicating whether the sensor is not calibrated,
+    // currently being calibrated, or has been calibrated successfully.
     CalibrationStatus getCalibrationStatus() { return calibStatus; }
 
 private:
@@ -142,3 +256,4 @@ private:
         MAHONY
     } filterMode;
 };
+#endif // MPU9250_H
