@@ -3,21 +3,22 @@
     "version": "1.0.0",
     "description": "",
     "keywords": "",
-    "repository":
-    {
-      "type": "git",
-      "url": "https://github.com/SkylabYnov/skylab-imu-lib.git"
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/SkylabYnov/skylab-imu-lib.git"
     },
-    "authors":
-    [
-      {
-        "name": "Skylab",
-        "email": "skylab.ydays@proton.me",
-        "maintainer": true
-      }
+    "authors": [
+        {
+            "name": "Skylab",
+            "email": "skylab.ydays@proton.me",
+            "maintainer": true
+        }
     ],
-    "dependencies": {
-    },
-    "frameworks": ["espidf"],
-    "platforms": ["espressif32"]
-  }
+    "dependencies": {},
+    "frameworks": [
+        "espidf"
+    ],
+    "platforms": [
+        "espressif32"
+    ]
+}
