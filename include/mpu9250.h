@@ -128,6 +128,21 @@ public:
         CALIBRATED
     };
 
+    // The `FilterMode` enum represents the filter mode used for orientation calculation.
+    // It can be one of the following values:
+    // - COMPLEMENTARY: Use the complementary filter for orientation estimation.
+    // - MAHONY: Use the Mahony filter for orientation estimation.
+    // The complementary filter combines accelerometer and gyroscope data to estimate orientation.
+    // The Mahony filter uses a quaternion-based approach to estimate orientation and includes an integral feedback loop.
+    // The choice of filter mode can affect the performance and accuracy of the orientation estimation.
+    // The complementary filter is simpler and faster, while the Mahony filter provides better performance in dynamic conditions.
+    // The filter mode can be set using the `setFilterMode` method.
+    enum FilterMode
+    {
+        COMPLEMENTARY,
+        MAHONY
+    } filterMode;
+
     // Constructor and Destructor
     MPU9250();
     ~MPU9250();
@@ -141,6 +156,20 @@ public:
     // It returns an ESP error code indicating the success or failure of the initialization.
     esp_err_t init(i2c_port_t i2cPort, uint8_t sdaPin, uint8_t sclPin);
 
+    // The `calibrate` method performs calibration of the accelerometer, gyroscope, and magnetometer.
+    // It collects a specified number of samples and computes the offsets for each sensor.
+    // The calibration process is performed in the background and can take some time.
+    // The method returns an ESP error code indicating the success or failure of the calibration.
+    // The calibration status can be monitored using the `getCalibrationStatus` method.
+    esp_err_t calibrate();
+
+    // The `setFilterMode` method sets the filter mode for orientation calculation.
+    // It takes a `FilterMode` enum value as a parameter and sets the filter mode accordingly.
+    // The filter mode can be set to either COMPLEMENTARY or MAHONY.
+    // The choice of filter mode can affect the performance and accuracy of the orientation estimation.
+    // The method returns an ESP error code indicating the success or failure of the operation.
+    esp_err_t setFilterMode(FilterMode mode);
+
     // The `startSensorTask` method starts the sensor task, which continuously reads sensor data
     // and processes it in the background. It returns an ESP error code indicating the success or failure.
     // The task runs in a FreeRTOS environment and uses a mutex for synchronization.
@@ -148,13 +177,6 @@ public:
     // The task also handles calibration and health monitoring.
     // The task runs at a specified frequency, which can be adjusted in the implementation.
     esp_err_t startSensorTask();
-
-    // The `calibrate` method performs calibration of the accelerometer, gyroscope, and magnetometer.
-    // It collects a specified number of samples and computes the offsets for each sensor.
-    // The calibration process is performed in the background and can take some time.
-    // The method returns an ESP error code indicating the success or failure of the calibration.
-    // The calibration status can be monitored using the `getCalibrationStatus` method.
-    esp_err_t calibrate();
 
     // The `getOrientation` method retrieves the current orientation of the sensor.
     // It returns an `Orientation` structure containing the roll, pitch, and yaw angles in degrees.
@@ -167,7 +189,6 @@ public:
     // They return `Vector3` structures containing the x, y, and z components of the respective sensor data.
     // The accelerometer readings are in g (gravitational units), the gyroscope readings are in degrees per second,
     // and the magnetometer readings are in microteslas (µT).
-
     Vector3 getAccel();
     Vector3 getGyro();
     Vector3 getMag();
@@ -193,6 +214,7 @@ public:
     // currently being calibrated, or has been calibrated successfully.
     CalibrationStatus getCalibrationStatus() { return calibStatus; }
 
+    
 private:
     // I2C Communication
     esp_err_t writeRegister(uint8_t addr, uint8_t reg, uint8_t data);
@@ -228,9 +250,6 @@ private:
     Vector3 mag;
     float temperature;
 
-    // Computed Orientation
-    Orientation orientation;
-
     // Filter State
     Vector3 gyroIntegrated;
     Vector3 mahonyIntegralError;
@@ -249,11 +268,7 @@ private:
     bool magAvailable;
     uint8_t magAdjustValues[3];
 
-    // Filter mode
-    enum FilterMode
-    {
-        COMPLEMENTARY,
-        MAHONY
-    } filterMode;
+    // Computed Orientation
+    Orientation orientation;
 };
 #endif // MPU9250_H
