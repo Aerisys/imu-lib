@@ -1,4 +1,5 @@
 #ifndef MPU9250_H
+#define MPU9250_H
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
