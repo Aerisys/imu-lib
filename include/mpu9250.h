@@ -141,7 +141,7 @@ public:
     {
         COMPLEMENTARY,
         MAHONY
-    } filterMode;
+    };
 
     // Constructor and Destructor
     MPU9250();
@@ -250,6 +250,9 @@ private:
     Vector3 mag;
     float temperature;
 
+    // Computed Orientation
+    Orientation orientation;
+
     // Filter State
     Vector3 gyroIntegrated;
     Vector3 mahonyIntegralError;
@@ -268,7 +271,7 @@ private:
     bool magAvailable;
     uint8_t magAdjustValues[3];
 
-    // Computed Orientation
-    Orientation orientation;
+    // Filter mode
+    FilterMode filterMode;
 };
 #endif // MPU9250_H
