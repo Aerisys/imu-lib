@@ -275,5 +275,8 @@ private:
 
     // Filter mode
     FilterMode filterMode;
+
+    // Quaternion state for Mahony filter
+    struct Quaternion { float w, x, y, z; } q;
 };
 #endif // MPU9250_H

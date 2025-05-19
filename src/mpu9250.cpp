@@ -22,9 +22,9 @@ MPU9250::MPU9250()
       errorCount(0),
       successCount(0),
       magAvailable(false),
-      filterMode(COMPLEMENTARY)
+      filterMode(COMPLEMENTARY),
+      q{1.0f, 0.0f, 0.0f, 0.0f} // Mahony quaternion init
 {
-
     memset(magAdjustValues, 0, sizeof(magAdjustValues));
     dataMutex = xSemaphoreCreateMutex();
 }
@@ -383,94 +383,73 @@ void MPU9250::updateMahonyFilter(float dt)
     float gy = gyro.y * DEG_TO_RAD;
     float gz = gyro.z * DEG_TO_RAD;
 
-    // Extract orientation quaternion components
-    float q0 = 1.0f; // Initialize quaternion if not already done
-    float q1 = 0.0f;
-    float q2 = 0.0f;
-    float q3 = 0.0f;
-
-    // Convert current euler angles to quaternion
-    float cr = cosf(orientation.roll * 0.5f * DEG_TO_RAD);
-    float sr = sinf(orientation.roll * 0.5f * DEG_TO_RAD);
-    float cp = cosf(orientation.pitch * 0.5f * DEG_TO_RAD);
-    float sp = sinf(orientation.pitch * 0.5f * DEG_TO_RAD);
-    float cy = cosf(orientation.yaw * 0.5f * DEG_TO_RAD);
-    float sy = sinf(orientation.yaw * 0.5f * DEG_TO_RAD);
-
-    q0 = cr * cp * cy + sr * sp * sy;
-    q1 = sr * cp * cy - cr * sp * sy;
-    q2 = cr * sp * cy + sr * cp * sy;
-    q3 = cr * cp * sy - sr * sp * cy;
+    // Unpack quaternion state
+    float q0 = q.w;
+    float q1 = q.x;
+    float q2 = q.y;
+    float q3 = q.z;
 
     // Normalize accelerometer measurement
-    float recipNorm = 1.0f / sqrtf(accel.x * accel.x + accel.y * accel.y + accel.z * accel.z);
-    if (isfinite(recipNorm))
-    {
-        float ax = accel.x * recipNorm;
-        float ay = accel.y * recipNorm;
-        float az = accel.z * recipNorm;
+    float norm = sqrtf(accel.x*accel.x + accel.y*accel.y + accel.z*accel.z);
+    if (norm == 0.0f) return; // avoid division by zero
+    norm = 1.0f / norm;
+    float ax = accel.x * norm;
+    float ay = accel.y * norm;
+    float az = accel.z * norm;
 
-        // Estimated direction of gravity from quaternion
-        float vx = 2.0f * (q1 * q3 - q0 * q2);
-        float vy = 2.0f * (q0 * q1 + q2 * q3);
-        float vz = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
+    // Estimated direction of gravity
+    float vx = 2.0f * (q1*q3 - q0*q2);
+    float vy = 2.0f * (q0*q1 + q2*q3);
+    float vz = q0*q0 - q1*q1 - q2*q2 + q3*q3;
 
-        // Error is cross product between estimated and measured direction of gravity
-        float ex = ay * vz - az * vy;
-        float ey = az * vx - ax * vz;
-        float ez = ax * vy - ay * vx;
+    // Error is cross product between measured and estimated gravity
+    float ex = (ay*vz - az*vy);
+    float ey = (az*vx - ax*vz);
+    float ez = (ax*vy - ay*vx);
 
-        // Apply feedback terms
-        if (MAHONY_KI > 0.0f)
-        {
-            mahonyIntegralError.x += ex * MAHONY_KI * dt;
-            mahonyIntegralError.y += ey * MAHONY_KI * dt;
-            mahonyIntegralError.z += ez * MAHONY_KI * dt;
-
-            // Apply integral feedback
-            gx += mahonyIntegralError.x;
-            gy += mahonyIntegralError.y;
-            gz += mahonyIntegralError.z;
-        }
-
-        // Apply proportional feedback
-        gx += ex * MAHONY_KP;
-        gy += ey * MAHONY_KP;
-        gz += ez * MAHONY_KP;
+    // Integral feedback
+    if (MAHONY_KI > 0.0f) {
+        mahonyIntegralError.x += ex * MAHONY_KI * dt;
+        mahonyIntegralError.y += ey * MAHONY_KI * dt;
+        mahonyIntegralError.z += ez * MAHONY_KI * dt;
+        gx += mahonyIntegralError.x;
+        gy += mahonyIntegralError.y;
+        gz += mahonyIntegralError.z;
     }
 
-    // Integrate rate of change of quaternion
-    gx *= 0.5f;
-    gy *= 0.5f;
-    gz *= 0.5f;
+    // Proportional feedback
+    gx += MAHONY_KP * ex;
+    gy += MAHONY_KP * ey;
+    gz += MAHONY_KP * ez;
 
+    // Integrate rate of change of quaternion
+    float half_dt = 0.5f * dt;
     float qa = q0;
     float qb = q1;
     float qc = q2;
     float qd = q3;
 
-    q0 += (-qb * gx - qc * gy - qd * gz) * dt;
-    q1 += (qa * gx + qc * gz - qd * gy) * dt;
-    q2 += (qa * gy - qb * gz + qd * gx) * dt;
-    q3 += (qa * gz + qb * gy - qc * gx) * dt;
+    q0 += (-qb * gx - qc * gy - qd * gz) * half_dt;
+    q1 += ( qa * gx + qc * gz - qd * gy) * half_dt;
+    q2 += ( qa * gy - qb * gz + qd * gx) * half_dt;
+    q3 += ( qa * gz + qb * gy - qc * gx) * half_dt;
 
     // Normalize quaternion
-    recipNorm = 1.0f / sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-    q0 *= recipNorm;
-    q1 *= recipNorm;
-    q2 *= recipNorm;
-    q3 *= recipNorm;
+    norm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+    norm = 1.0f / norm;
+    q.w = q0 * norm;
+    q.x = q1 * norm;
+    q.y = q2 * norm;
+    q.z = q3 * norm;
 
-    // Convert quaternion to Euler angles
-    orientation.roll = atan2f(2.0f * (q0 * q1 + q2 * q3), 1.0f - 2.0f * (q1 * q1 + q2 * q2)) * RAD_TO_DEG;
-    orientation.pitch = asinf(2.0f * (q0 * q2 - q3 * q1)) * RAD_TO_DEG;
-    orientation.yaw = atan2f(2.0f * (q0 * q3 + q1 * q2), 1.0f - 2.0f * (q2 * q2 + q3 * q3)) * RAD_TO_DEG;
+    // Convert quaternion to Euler angles (deg)
+    orientation.roll  = atan2f(2.0f*(q.w*q.x + q.y*q.z), 1.0f - 2.0f*(q.x*q.x + q.y*q.y)) * RAD_TO_DEG;
+    orientation.pitch = asinf( 2.0f*(q.w*q.y - q.z*q.x)) * RAD_TO_DEG;
+    orientation.yaw   = atan2f(2.0f*(q.w*q.z + q.x*q.y), 1.0f - 2.0f*(q.y*q.y + q.z*q.z)) * RAD_TO_DEG;
 
-    // Normalize yaw to 0-360
-    while (orientation.yaw < 0)
-        orientation.yaw += 360.0f;
-    while (orientation.yaw >= 360.0f)
-        orientation.yaw -= 360.0f;
+    // Keep yaw in [0,360)
+    if (orientation.yaw < 0) orientation.yaw += 360.0f;
+    else if (orientation.yaw >= 360.0f) orientation.yaw -= 360.0f;
 }
 
 void MPU9250::processMeasurements(float dt)
