@@ -59,14 +59,14 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
     esp_err_t err = i2c_param_config(i2cPort, &conf);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG_MPU, "I2C config failed");
+        ESP_LOGE(TAG_MPU9250, "I2C config failed");
         return err;
     }
 
     err = i2c_driver_install(i2cPort, conf.mode, 0, 0, 0);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG_MPU, "I2C driver install failed");
+        ESP_LOGE(TAG_MPU9250, "I2C driver install failed");
         return err;
     }
 
@@ -75,8 +75,8 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
     err = readRegisters(MPU9250_ADDR, MPU9250_WHO_AM_I, 1, &whoami);
     if (err != ESP_OK || whoami != 0x71)
     {
-        ESP_LOGE(TAG_MPU, "MPU9250 not found, WHO_AM_I = 0x%02x", whoami);
-        ESP_LOGE(TAG_MPU, "error: %d", err);
+        ESP_LOGE(TAG_MPU9250, "MPU9250 not found, WHO_AM_I = 0x%02x", whoami);
+        ESP_LOGE(TAG_MPU9250, "error: %d", err);
         return ESP_FAIL;
     }
 
@@ -121,7 +121,7 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
     err = readRegisters(AK8963_ADDR, AK8963_WHO_AM_I, 1, &magWhoami);
     if (err == ESP_OK && magWhoami == 0x48)
     {
-        ESP_LOGI(TAG_MPU, "AK8963 magnetometer found");
+        ESP_LOGI(TAG_MPU9250, "AK8963 magnetometer found");
         magAvailable = true;
 
         // Reset AK8963
@@ -148,7 +148,7 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
     }
     else
     {
-        ESP_LOGW(TAG_MPU, "AK8963 magnetometer not found");
+        ESP_LOGW(TAG_MPU9250, "AK8963 magnetometer not found");
         magAvailable = false;
     }
 
@@ -171,7 +171,7 @@ esp_err_t MPU9250::writeRegister(uint8_t addr, uint8_t reg, uint8_t data)
     if (ret != ESP_OK)
     {
         errorCount++;
-        ESP_LOGD(TAG_MPU, "Write register failed: device=0x%02x, reg=0x%02x, err=%d", addr, reg, ret);
+        ESP_LOGD(TAG_MPU9250, "Write register failed: device=0x%02x, reg=0x%02x, err=%d", addr, reg, ret);
     }
     else
     {
@@ -204,7 +204,7 @@ esp_err_t MPU9250::readRegisters(uint8_t addr, uint8_t reg, uint8_t length, uint
     if (ret != ESP_OK)
     {
         errorCount++;
-        ESP_LOGD(TAG_MPU, "Read registers failed: device=0x%02x, reg=0x%02x, len=%d, err=%d", addr, reg, length, ret);
+        ESP_LOGD(TAG_MPU9250, "Read registers failed: device=0x%02x, reg=0x%02x, len=%d, err=%d", addr, reg, length, ret);
     }
     else
     {
@@ -491,7 +491,7 @@ void MPU9250::sensorTask(void *arg)
     MPU9250 *sensor = static_cast<MPU9250 *>(arg);
     sensor->lastProcessTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-    ESP_LOGI(TAG_MPU, "Sensor task started");
+    ESP_LOGI(TAG_MPU9250, "Sensor task started");
     while (true)
     {
         // Calculate time delta
@@ -514,7 +514,7 @@ void MPU9250::sensorTask(void *arg)
             {
                 sensor->processMeasurements(dt);
                 xSemaphoreGive(sensor->dataMutex);
-                ESP_LOGI(TAG_MPU, "Orientation: Roll=%.2f, Pitch=%.2f, Yaw=%.2f", sensor->orientation.roll, sensor->orientation.pitch, sensor->orientation.yaw);
+                ESP_LOGI(TAG_MPU9250, "Orientation: Roll=%.2f, Pitch=%.2f, Yaw=%.2f", sensor->orientation.roll, sensor->orientation.pitch, sensor->orientation.yaw);
             }
         }
 
@@ -535,7 +535,7 @@ esp_err_t MPU9250::startSensorTask()
 
     if (ret != pdPASS)
     {
-        ESP_LOGE(TAG_MPU, "Failed to create sensor task");
+        ESP_LOGE(TAG_MPU9250, "Failed to create sensor task");
         return ESP_FAIL;
     }
 
@@ -546,7 +546,7 @@ esp_err_t MPU9250::calibrate()
 {
     if (calibStatus == CALIBRATING)
     {
-        ESP_LOGW(TAG_MPU, "Calibration already in progress");
+        ESP_LOGW(TAG_MPU9250, "Calibration already in progress");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -573,7 +573,7 @@ esp_err_t MPU9250::calibrate()
 
     if (ret != pdPASS)
     {
-        ESP_LOGE(TAG_MPU, "Failed to create calibration task");
+        ESP_LOGE(TAG_MPU9250, "Failed to create calibration task");
         calibStatus = NOT_CALIBRATED;
         return ESP_FAIL;
     }
@@ -583,7 +583,7 @@ esp_err_t MPU9250::calibrate()
 
 void MPU9250::resetCalibration()
 {
-    ESP_LOGI(TAG_MPU, "Resetting calibration values");
+    ESP_LOGI(TAG_MPU9250, "Resetting calibration values");
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
     {
         accelOffset = {0, 0, 0};
@@ -591,13 +591,13 @@ void MPU9250::resetCalibration()
         magOffset = {0, 0, 0};
         magScale = {1.0f, 1.0f, 1.0f};
         xSemaphoreGive(dataMutex);
-        ESP_LOGI(TAG_MPU, "Calibration values reset");
+        ESP_LOGI(TAG_MPU9250, "Calibration values reset");
     }
 }
 
 void MPU9250::performCalibration()
 {
-    ESP_LOGI(TAG_MPU, "Starting calibration, keep the sensor still...");
+    ESP_LOGI(TAG_MPU9250, "Starting calibration, keep the sensor still...");
     vTaskDelay(pdMS_TO_TICKS(1000)); // Let sensor stabilize
 
     Vector3 accelSum = {0, 0, 0};
@@ -641,7 +641,7 @@ void MPU9250::performCalibration()
 
         if (i % 100 == 0)
         {
-            ESP_LOGI(TAG_MPU, "Calibration progress: %d%%", i * 100 / CALIBRATION_SAMPLES);
+            ESP_LOGI(TAG_MPU9250, "Calibration progress: %d%%", i * 100 / CALIBRATION_SAMPLES);
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -686,15 +686,15 @@ void MPU9250::performCalibration()
         xSemaphoreGive(dataMutex);
     }
 
-    ESP_LOGI(TAG_MPU, "Calibration complete");
+    ESP_LOGI(TAG_MPU9250, "Calibration complete");
 
     // Log calibration results
-    ESP_LOGI(TAG_MPU, "Accel offsets: %.3f, %.3f, %.3f", accelOffset.x, accelOffset.y, accelOffset.z);
-    ESP_LOGI(TAG_MPU, "Gyro offsets: %.3f, %.3f, %.3f", gyroOffset.x, gyroOffset.y, gyroOffset.z);
+    ESP_LOGI(TAG_MPU9250, "Accel offsets: %.3f, %.3f, %.3f", accelOffset.x, accelOffset.y, accelOffset.z);
+    ESP_LOGI(TAG_MPU9250, "Gyro offsets: %.3f, %.3f, %.3f", gyroOffset.x, gyroOffset.y, gyroOffset.z);
     if (magAvailable)
     {
-        ESP_LOGI(TAG_MPU, "Mag offsets: %.3f, %.3f, %.3f", magOffset.x, magOffset.y, magOffset.z);
-        ESP_LOGI(TAG_MPU, "Mag scale: %.3f, %.3f, %.3f", magScale.x, magScale.y, magScale.z);
+        ESP_LOGI(TAG_MPU9250, "Mag offsets: %.3f, %.3f, %.3f", magOffset.x, magOffset.y, magOffset.z);
+        ESP_LOGI(TAG_MPU9250, "Mag scale: %.3f, %.3f, %.3f", magScale.x, magScale.y, magScale.z);
     }
 }
 
@@ -770,7 +770,7 @@ esp_err_t MPU9250::setFilterMode(FilterMode mode)
     }
     else
     {
-        ESP_LOGE(TAG_MPU, "Invalid filter mode");
+        ESP_LOGE(TAG_MPU9250, "Invalid filter mode");
         return ESP_ERR_INVALID_ARG;
     }
     return ESP_OK;

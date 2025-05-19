@@ -1,5 +1,6 @@
 #ifndef MPU9250_H
 #define MPU9250_H
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -40,7 +41,7 @@ using std::min;
 #define MAHONY_KI 0.1f     // Mahony filter integral gain
 
 // Debugging
-#define TAG_MPU "MPU9250"
+#define TAG_MPU9250 "MPU9250"
 #define LOG_LEVEL ESP_LOG_INFO
 
 // --------------------------------------------------------------------------------
