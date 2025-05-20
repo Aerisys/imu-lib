@@ -15,7 +15,6 @@ extern "C" void app_main()
         return;
     }
 
-    imu.setInvertAxis(true, true, true);
     imu.setSwitchRollPitch(true);
 
     ESP_LOGI("APP", "MPU9250 initialized");
