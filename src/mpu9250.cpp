@@ -56,6 +56,7 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
     conf.master.clk_speed = 100000;
     conf.clk_flags = 0;
 
+    
     esp_err_t err = i2c_param_config(i2cPort, &conf);
     if (err != ESP_OK)
     {
@@ -63,6 +64,12 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
         return err;
     }
 
+    // Initialize I2C driver
+    err = i2c_driver_delete(i2cPort);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG_MPU9250, "I2C driver delete failed");
+    }
     err = i2c_driver_install(i2cPort, conf.mode, 0, 0, 0);
     if (err != ESP_OK)
     {
@@ -82,14 +89,19 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
 
     // Reset device
     err = writeRegister(MPU9250_ADDR, MPU9250_PWR_MGMT_1, 0x80);
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_MPU9250, "Failed to reset MPU9250");
         return err;
+    }
+
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Wake up device
     err = writeRegister(MPU9250_ADDR, MPU9250_PWR_MGMT_1, 0x01);
-    if (err != ESP_OK)
+    if (err != ESP_OK){
+        ESP_LOGE(TAG_MPU9250, "Failed to wake up MPU9250");
         return err;
+    }
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // Configure gyro and accel
@@ -268,21 +280,21 @@ void MPU9250::readAllSensors()
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
     {
         // Read accelerometer
-        accel.x = readAccel(0) - accelOffset.x;
-        accel.y = readAccel(2) - accelOffset.y;
-        accel.z = readAccel(4) - accelOffset.z;
+        accel.x = invertAxis.x * (readAccel(0) - accelOffset.x);
+        accel.y = invertAxis.y * (readAccel(2) - accelOffset.y);
+        accel.z = invertAxis.z * (readAccel(4) - accelOffset.z);
 
         // Read gyroscope
-        gyro.x = readGyro(0) - gyroOffset.x;
-        gyro.y = readGyro(2) - gyroOffset.y;
-        gyro.z = readGyro(4) - gyroOffset.z;
+        gyro.x = invertAxis.x * (readGyro(0) - gyroOffset.x);
+        gyro.y = invertAxis.y * (readGyro(2) - gyroOffset.y);
+        gyro.z = invertAxis.z * (readGyro(4) - gyroOffset.z);
 
         // Read magnetometer if available
         if (magAvailable)
         {
-            mag.x = (readMag(0) - magOffset.x) * magScale.x;
-            mag.y = (readMag(2) - magOffset.y) * magScale.y;
-            mag.z = (readMag(4) - magOffset.z) * magScale.z;
+            mag.x = invertAxis.x * ((readMag(0) - magOffset.x) * magScale.x);
+            mag.y = invertAxis.y * ((readMag(2) - magOffset.y) * magScale.y);
+            mag.z = invertAxis.z * ((readMag(4) - magOffset.z) * magScale.z);
         }
 
         // Read temperature
@@ -346,8 +358,16 @@ void MPU9250::updateComplementaryFilter(float dt)
     float pitchAcc = atan2f(-accel.x, sqrtf(accel.y * accel.y + accel.z * accel.z)) * RAD_TO_DEG;
 
     // Complementary filter
-    orientation.roll = FILTER_ALPHA * (orientation.roll + gyro.x * dt) + (1.0f - FILTER_ALPHA) * rollAcc;
-    orientation.pitch = FILTER_ALPHA * (orientation.pitch + gyro.y * dt) + (1.0f - FILTER_ALPHA) * pitchAcc;
+    if (switchRollPitch)
+    {
+        orientation.roll = FILTER_ALPHA * (orientation.roll + gyro.y * dt) + (1.0f - FILTER_ALPHA) * rollAcc;
+        orientation.pitch = FILTER_ALPHA * (orientation.pitch + gyro.x * dt) + (1.0f - FILTER_ALPHA) * pitchAcc;
+    }
+    else
+    {
+        orientation.roll = FILTER_ALPHA * (orientation.roll + gyro.x * dt) + (1.0f - FILTER_ALPHA) * rollAcc;
+        orientation.pitch = FILTER_ALPHA * (orientation.pitch + gyro.y * dt) + (1.0f - FILTER_ALPHA) * pitchAcc;
+    }
 
     // Update yaw from gyro or magnetometer
     if (magAvailable)
@@ -443,8 +463,15 @@ void MPU9250::updateMahonyFilter(float dt)
     q.z = q3 * norm;
 
     // Convert quaternion to Euler angles (deg)
-    orientation.roll  = atan2f(2.0f*(q.w*q.x + q.y*q.z), 1.0f - 2.0f*(q.x*q.x + q.y*q.y)) * RAD_TO_DEG;
-    orientation.pitch = asinf( 2.0f*(q.w*q.y - q.z*q.x)) * RAD_TO_DEG;
+    if (switchRollPitch)
+    {
+        orientation.pitch  = atan2f(2.0f*(q.w*q.x + q.y*q.z), 1.0f - 2.0f*(q.x*q.x + q.y*q.y)) * RAD_TO_DEG;
+        orientation.roll = asinf( 2.0f*(q.w*q.y - q.z*q.x)) * RAD_TO_DEG;
+    } else {
+        orientation.roll  = atan2f(2.0f*(q.w*q.x + q.y*q.z), 1.0f - 2.0f*(q.x*q.x + q.y*q.y)) * RAD_TO_DEG;
+        orientation.pitch = asinf( 2.0f*(q.w*q.y - q.z*q.x)) * RAD_TO_DEG;
+    }
+    
     orientation.yaw   = atan2f(2.0f*(q.w*q.z + q.x*q.y), 1.0f - 2.0f*(q.y*q.y + q.z*q.z)) * RAD_TO_DEG;
 
     // Keep yaw in [0,360)
@@ -588,12 +615,12 @@ void MPU9250::performCalibration()
     for (int i = 0; i < CALIBRATION_SAMPLES; i++)
     {
         // Read raw values without applying offsets
-        float ax = readAccel(0);
-        float ay = readAccel(2);
-        float az = readAccel(4);
-        float gx = readGyro(0);
-        float gy = readGyro(2);
-        float gz = readGyro(4);
+        float ax = invertAxis.x * readAccel(0);
+        float ay = invertAxis.y * readAccel(2);
+        float az = invertAxis.z * readAccel(4);
+        float gx = invertAxis.x * readGyro(0);
+        float gy = invertAxis.y * readGyro(2);
+        float gz = invertAxis.z * readGyro(4);
 
         accelSum.x += ax;
         accelSum.y += ay;
@@ -605,9 +632,9 @@ void MPU9250::performCalibration()
         // For magnetometer, record min/max values while rotating the sensor
         if (magAvailable)
         {
-            float mx = readMag(0);
-            float my = readMag(2);
-            float mz = readMag(4);
+            float mx = invertAxis.x * readMag(0);
+            float my = invertAxis.y * readMag(2);
+            float mz = invertAxis.z * readMag(4);
 
             magMin.x = min(magMin.x, mx);
             magMin.y = min(magMin.y, my);
@@ -752,5 +779,20 @@ esp_err_t MPU9250::setFilterMode(FilterMode mode)
         ESP_LOGE(TAG_MPU9250, "Invalid filter mode");
         return ESP_ERR_INVALID_ARG;
     }
+    return ESP_OK;
+}
+
+esp_err_t MPU9250::setInvertAxis(bool invertX, bool invertY, bool invertZ)
+{
+
+    invertAxis.x = invertX ? -1 : 1;
+    invertAxis.y = invertY ? -1 : 1;
+    invertAxis.z = invertZ ? -1 : 1;
+    return ESP_OK;
+}
+
+esp_err_t MPU9250::setSwitchRollPitch(bool switchRollPitch)
+{
+    switchRollPitch = switchRollPitch;
     return ESP_OK;
 }

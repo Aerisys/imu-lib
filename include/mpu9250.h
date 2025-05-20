@@ -216,7 +216,19 @@ public:
     // currently being calibrated, or has been calibrated successfully.
     CalibrationStatus getCalibrationStatus() { return calibStatus; }
 
-    
+    // The `setInvertAxis` method sets the axis inversion for the sensor readings.
+    // It takes three boolean parameters indicating whether to invert the x, y, and z axes respectively.    
+    // Inverting an axis means that the readings from that axis will be negated.
+    // This can be useful for correcting the orientation of the sensor in certain applications.
+    // The method returns an ESP error code indicating the success or failure of the operation.
+    esp_err_t setInvertAxis(bool invertX, bool invertY, bool invertZ);
+
+    // The `setSwitchRollPitch` method sets whether to switch the roll and pitch axes.
+    // It takes a boolean parameter indicating whether to switch the axes.
+    // Switching the roll and pitch axes means that the readings from these axes will be exchanged.
+    // This can be useful for correcting the orientation of the sensor in certain applications.
+    // The method returns an ESP error code indicating the success or failure of the operation.
+    esp_err_t setSwitchRollPitch(bool switchRollPitch);
 private:
     // I2C Communication
     esp_err_t writeRegister(uint8_t addr, uint8_t reg, uint8_t data);
@@ -278,5 +290,16 @@ private:
 
     // Quaternion state for Mahony filter
     struct Quaternion { float w, x, y, z; } q;
+
+    // Inverted axis
+    struct InvertAxis
+    {
+        int8_t x;
+        int8_t y;
+        int8_t z;
+    } invertAxis = {1, 1, 1};
+
+    // Switch roll and pitch
+    bool switchRollPitch;
 };
 #endif // MPU9250_H
