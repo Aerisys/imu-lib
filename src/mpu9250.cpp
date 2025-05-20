@@ -1,5 +1,5 @@
 #include <mpu9250.h>
-#define I2C_MASTER_NUM I2C_NUM_0
+
 // Implementation
 MPU9250::MPU9250()
     : i2cPort(I2C_NUM_0),
@@ -57,7 +57,6 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
     conf.master.clk_speed = 100000;
     conf.clk_flags = 0;
 
-    
     err = i2c_param_config(i2cPort, &conf);
     if (err != ESP_OK)
     {
@@ -65,8 +64,7 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
         return err;
     }
 
-
-    //Initialize I2C driver
+    // Initialize I2C driver
     err = i2c_driver_install(i2cPort, conf.mode, 0, 0, 0);
     if (err != ESP_OK)
     {
@@ -86,7 +84,8 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
 
     // Reset device
     err = writeRegister(MPU9250_ADDR, MPU9250_PWR_MGMT_1, 0x80);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG_MPU9250, "Failed to reset MPU9250");
         return err;
     }
@@ -95,7 +94,8 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
 
     // Wake up device
     err = writeRegister(MPU9250_ADDR, MPU9250_PWR_MGMT_1, 0x01);
-    if (err != ESP_OK){
+    if (err != ESP_OK)
+    {
         ESP_LOGE(TAG_MPU9250, "Failed to wake up MPU9250");
         return err;
     }
@@ -393,12 +393,37 @@ void MPU9250::updateComplementaryFilter(float dt)
         orientation.yaw -= 360.0f;
 }
 
+// Helper function for constraining values
+inline float constrain(float val, float min, float max)
+{
+    if (val < min)
+        return min;
+    if (val > max)
+        return max;
+    return val;
+}
+
+// Fast inverse square root implementation (Quake III algorithm)
+inline float fastInvSqrt(float x)
+{
+    float halfx = 0.5f * x;
+    int i = *(int *)&x;
+    i = 0x5f3759df - (i >> 1);
+    x = *(float *)&i;
+    x = x * (1.5f - halfx * x * x); // One Newton iteration
+    return x;
+}
+
 void MPU9250::updateMahonyFilter(float dt)
 {
+    // Early exit if dt is too small to avoid numerical instability
+    if (dt < 1e-6f)
+        return;
+
     // Convert gyro to rad/s
-    float gx = gyro.x * DEG_TO_RAD;
-    float gy = gyro.y * DEG_TO_RAD;
-    float gz = gyro.z * DEG_TO_RAD;
+    float gx = (gyro.x) * DEG_TO_RAD;
+    float gy = (gyro.y) * DEG_TO_RAD;
+    float gz = (gyro.z) * DEG_TO_RAD;
 
     // Unpack quaternion state
     float q0 = q.w;
@@ -407,73 +432,104 @@ void MPU9250::updateMahonyFilter(float dt)
     float q3 = q.z;
 
     // Normalize accelerometer measurement
-    float norm = sqrtf(accel.x*accel.x + accel.y*accel.y + accel.z*accel.z);
-    if (norm == 0.0f) return; // avoid division by zero
-    norm = 1.0f / norm;
-    float ax = accel.x * norm;
-    float ay = accel.y * norm;
-    float az = accel.z * norm;
+    float ax = accel.x;
+    float ay = accel.y;
+    float az = accel.z;
 
-    // Estimated direction of gravity
-    float vx = 2.0f * (q1*q3 - q0*q2);
-    float vy = 2.0f * (q0*q1 + q2*q3);
-    float vz = q0*q0 - q1*q1 - q2*q2 + q3*q3;
+    float accNormSq = ax * ax + ay * ay + az * az;
+    if (accNormSq < 1e-12f)
+        return; // Avoid division by very small number
+    float invAccNorm = fastInvSqrt(accNormSq);
+    ax *= invAccNorm;
+    ay *= invAccNorm;
+    az *= invAccNorm;
+
+    // Estimated direction of gravity using quaternion rotation
+    // Optimized calculation without explicitly computing the rotation matrix
+    float q0q1 = q0 * q1;
+    float q0q2 = q0 * q2;
+    float q1q3 = q1 * q3;
+    float q2q3 = q2 * q3;
+
+    float vx = 2.0f * (q1q3 - q0q2);
+    float vy = 2.0f * (q0q1 + q2q3);
+    float vz = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
 
     // Error is cross product between measured and estimated gravity
-    float ex = (ay*vz - az*vy);
-    float ey = (az*vx - ax*vz);
-    float ez = (ax*vy - ay*vx);
+    float ex = (ay * vz - az * vy);
+    float ey = (az * vx - ax * vz);
+    float ez = (ax * vy - ay * vx);
 
-    // Integral feedback
-    if (MAHONY_KI > 0.0f) {
+    // Apply integral feedback with anti-windup
+    const float maxIntegralError = 0.1f; // Prevent unbounded growth
+
+    if (MAHONY_KI > 0.0f)
+    {
         mahonyIntegralError.x += ex * MAHONY_KI * dt;
         mahonyIntegralError.y += ey * MAHONY_KI * dt;
         mahonyIntegralError.z += ez * MAHONY_KI * dt;
+
+        // Apply anti-windup to integral term
+        mahonyIntegralError.x = constrain(mahonyIntegralError.x, -maxIntegralError, maxIntegralError);
+        mahonyIntegralError.y = constrain(mahonyIntegralError.y, -maxIntegralError, maxIntegralError);
+        mahonyIntegralError.z = constrain(mahonyIntegralError.z, -maxIntegralError, maxIntegralError);
+
+        // Apply integral correction to gyro measurements
         gx += mahonyIntegralError.x;
         gy += mahonyIntegralError.y;
         gz += mahonyIntegralError.z;
     }
 
-    // Proportional feedback
+    // Apply proportional feedback
     gx += MAHONY_KP * ex;
     gy += MAHONY_KP * ey;
     gz += MAHONY_KP * ez;
 
-    // Integrate rate of change of quaternion
+    // Integrate quaternion rate using more efficient integration
+    // Pre-calculate half_dt to avoid repeated multiplication
     float half_dt = 0.5f * dt;
-    float qa = q0;
-    float qb = q1;
-    float qc = q2;
-    float qd = q3;
 
-    q0 += (-qb * gx - qc * gy - qd * gz) * half_dt;
-    q1 += ( qa * gx + qc * gz - qd * gy) * half_dt;
-    q2 += ( qa * gy - qb * gz + qd * gx) * half_dt;
-    q3 += ( qa * gz + qb * gy - qc * gx) * half_dt;
+    // First-order quaternion integration
+    q0 += (-q1 * gx - q2 * gy - q3 * gz) * half_dt;
+    q1 += (q0 * gx + q2 * gz - q3 * gy) * half_dt;
+    q2 += (q0 * gy - q1 * gz + q3 * gx) * half_dt;
+    q3 += (q0 * gz + q1 * gy - q2 * gx) * half_dt;
 
-    // Normalize quaternion
-    norm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
-    norm = 1.0f / norm;
-    q.w = q0 * norm;
-    q.x = q1 * norm;
-    q.y = q2 * norm;
-    q.z = q3 * norm;
+    // Normalize quaternion - using fast inverse square root would be even faster
+    float qNormSq = q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3;
+    if (qNormSq < 1e-12f)
+    {
+        // Handle degenerate case
+        q.w = 1.0f;
+        q.x = q.y = q.z = 0.0f;
+    }
+    else
+    {
+        // Normal case
+        float invQNorm = fastInvSqrt(qNormSq);
+        q.w = q0 * invQNorm;
+        q.x = q1 * invQNorm;
+        q.y = q2 * invQNorm;
+        q.z = q3 * invQNorm;
+    }
 
     // Convert quaternion to Euler angles (deg)
+    // Use quaternion to Euler conversion with atan2 for better numerical stability
     if (switchRollPitch)
     {
-        orientation.pitch  = atan2f(2.0f*(q.w*q.x + q.y*q.z), 1.0f - 2.0f*(q.x*q.x + q.y*q.y)) * RAD_TO_DEG;
-        orientation.roll = asinf( 2.0f*(q.w*q.y - q.z*q.x)) * RAD_TO_DEG;
-    } else {
-        orientation.roll  = atan2f(2.0f*(q.w*q.x + q.y*q.z), 1.0f - 2.0f*(q.x*q.x + q.y*q.y)) * RAD_TO_DEG;
-        orientation.pitch = asinf( 2.0f*(q.w*q.y - q.z*q.x)) * RAD_TO_DEG;
+        orientation.pitch = atan2f(2.0f * (q.w * q.x + q.y * q.z), 1.0f - 2.0f * (q.x * q.x + q.y * q.y)) * RAD_TO_DEG;
+        orientation.roll = asinf(constrain(2.0f * (q.w * q.y - q.z * q.x), -1.0f, 1.0f)) * RAD_TO_DEG;
     }
-    
-    orientation.yaw   = atan2f(2.0f*(q.w*q.z + q.x*q.y), 1.0f - 2.0f*(q.y*q.y + q.z*q.z)) * RAD_TO_DEG;
+    else
+    {
+        orientation.roll = atan2f(2.0f * (q.w * q.x + q.y * q.z), 1.0f - 2.0f * (q.x * q.x + q.y * q.y)) * RAD_TO_DEG;
+        orientation.pitch = asinf(constrain(2.0f * (q.w * q.y - q.z * q.x), -1.0f, 1.0f)) * RAD_TO_DEG;
+    }
 
-    // Keep yaw in [0,360)
-    if (orientation.yaw < 0) orientation.yaw += 360.0f;
-    else if (orientation.yaw >= 360.0f) orientation.yaw -= 360.0f;
+    orientation.yaw = atan2f(2.0f * (q.w * q.z + q.x * q.y), 1.0f - 2.0f * (q.y * q.y + q.z * q.z)) * RAD_TO_DEG;
+
+    // Normalize yaw to [0,360) range
+    orientation.yaw = fmodf(orientation.yaw + 360.0f, 360.0f);
 }
 
 void MPU9250::processMeasurements(float dt)

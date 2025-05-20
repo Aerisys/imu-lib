@@ -14,9 +14,6 @@ extern "C" void app_main()
         ESP_LOGE("APP", "Error code: %d", err);
         return;
     }
-
-    imu.setSwitchRollPitch(true);
-
     ESP_LOGI("APP", "MPU9250 initialized");
 
     err = imu.calibrate();
@@ -28,6 +25,12 @@ extern "C" void app_main()
     ESP_LOGI("APP", "Calibration started");
 
     err = imu.setFilterMode(MPU9250::MAHONY);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("APP", "Failed to set filter mode");
+        return;
+    }
+    ESP_LOGI("APP", "Filter mode set to Mahony");
 
     err = imu.startSensorTask(); // Assuming this creates a FreeRTOS task for reading sensor data
     if (err != ESP_OK)
