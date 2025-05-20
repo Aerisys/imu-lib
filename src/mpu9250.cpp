@@ -1,5 +1,5 @@
 #include <mpu9250.h>
-
+#define I2C_MASTER_NUM I2C_NUM_0
 // Implementation
 MPU9250::MPU9250()
     : i2cPort(I2C_NUM_0),
@@ -41,6 +41,44 @@ MPU9250::~MPU9250()
         vSemaphoreDelete(dataMutex);
     }
 }
+void try_mpu9250() {
+    ESP_LOGI("MPU9250", "Trying to communicate with MPU9250...");
+
+    uint8_t data;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+
+    // Start condition
+    i2c_master_start(cmd);
+
+    // Write device address with write bit
+    i2c_master_write_byte(cmd, (0x68 << 1) | I2C_MASTER_WRITE, true);
+
+    // Write register address (WHO_AM_I = 0x75)
+    i2c_master_write_byte(cmd, 0x75, true);
+
+    // Repeated start condition
+    i2c_master_start(cmd);
+
+    // Write device address with read bit
+    i2c_master_write_byte(cmd, (0x68 << 1) | I2C_MASTER_READ, true);
+
+    // Read one byte with NACK (end of reading)
+    i2c_master_read_byte(cmd, &data, I2C_MASTER_NACK);
+
+    // Stop condition
+    i2c_master_stop(cmd);
+
+    // Execute I2C commands
+    esp_err_t err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+
+    i2c_cmd_link_delete(cmd);
+
+    if (err == ESP_OK) {
+        ESP_LOGI("MPU9250", "MPU9250 WHO_AM_I: 0x%02X", data);
+    } else {
+        ESP_LOGE("MPU9250", "Failed to communicate with MPU9250, error = %d", err);
+    }
+}
 
 esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
 {
@@ -48,6 +86,7 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
 
     // Configure I2C
     i2c_config_t conf;
+    esp_err_t err;
     conf.mode = I2C_MODE_MASTER;
     conf.sda_io_num = sdaPin;
     conf.scl_io_num = sclPin;
@@ -57,24 +96,63 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
     conf.clk_flags = 0;
 
     
-    esp_err_t err = i2c_param_config(i2cPort, &conf);
+    err = i2c_param_config(i2cPort, &conf);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG_MPU9250, "I2C config failed");
         return err;
     }
 
-    // Initialize I2C driver
+
+    //Initialize I2C driver
     err = i2c_driver_delete(i2cPort);
-    if (err != ESP_OK)
+    if (err == ESP_OK)
     {
-        ESP_LOGE(TAG_MPU9250, "I2C driver delete failed");
+        ESP_LOGE(TAG_MPU9250, "I2C driver deleted");
     }
     err = i2c_driver_install(i2cPort, conf.mode, 0, 0, 0);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG_MPU9250, "I2C driver install failed");
-        return err;
+    // if (err != ESP_OK)
+    // {
+    //     ESP_LOGE(TAG_MPU9250, "I2C driver install failed");
+    //     return err;
+    // }
+
+    for (int addr = 1; addr < 127; addr++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 50 / portTICK_PERIOD_MS);
+        i2c_cmd_link_delete(cmd);
+        if (err == ESP_OK) {
+            ESP_LOGI("SCAN", "Found device at 0x%02X", addr);
+
+            // Optionally, you can read a byte from the device to confirm it's responsive
+            cmd = i2c_cmd_link_create();
+            i2c_master_start(cmd);
+            i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_READ, true);
+            uint8_t data;
+            i2c_master_read_byte(cmd, &data, I2C_MASTER_NACK);
+            i2c_master_stop(cmd);
+            err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 50 / portTICK_PERIOD_MS);
+            i2c_cmd_link_delete(cmd);
+            if (err == ESP_OK) {
+                ESP_LOGI("SCAN", "Device at 0x%02X responded with data: 0x%02X", addr, data);
+                try_mpu9250(); // Call the function to try to communicate with the MPU9250
+            } else {
+                ESP_LOGE("SCAN", "Failed to read from device at 0x%02X", addr);
+            }
+        }
+    }
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (0x68 << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_stop(cmd);
+    err = i2c_master_cmd_begin(I2C_NUM_0, cmd, 50 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+    if (err == ESP_OK) {
+        ESP_LOGI("SCAN", "Pass");
     }
 
     // Check MPU9250 identity
