@@ -517,7 +517,7 @@ void MPU9250::sensorTask(void *arg)
             {
                 sensor->processMeasurements(dt);
                 xSemaphoreGive(sensor->dataMutex);
-                ESP_LOGI(TAG_MPU9250, "Orientation: Roll=%.2f, Pitch=%.2f, Yaw=%.2f", sensor->orientation.roll, sensor->orientation.pitch, sensor->orientation.yaw);
+                //ESP_LOGI(TAG_MPU9250, "Orientation: Roll=%.2f, Pitch=%.2f, Yaw=%.2f", sensor->orientation.roll, sensor->orientation.pitch, sensor->orientation.yaw);
             }
         }
 
