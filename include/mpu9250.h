@@ -257,7 +257,6 @@ private:
     i2c_port_t i2cPort;
     TaskHandle_t taskHandle;
     SemaphoreHandle_t dataMutex;
-    uint32_t lastProcessTime;
 
     // Sensor Data
     Vector3 accel;

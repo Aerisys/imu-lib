@@ -6,7 +6,6 @@ MPU9250::MPU9250()
     : i2cPort(I2C_NUM_0),
       taskHandle(nullptr),
       dataMutex(nullptr),
-      lastProcessTime(0),
       accel{0, 0, 0},
       gyro{0, 0, 0},
       mag{0, 0, 0},
@@ -493,36 +492,139 @@ void MPU9250::processMeasurements(float dt)
 void MPU9250::sensorTask(void *arg)
 {
     MPU9250 *sensor = static_cast<MPU9250 *>(arg);
-    sensor->lastProcessTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    int64_t lastTime = esp_timer_get_time();
+
+    uint32_t loopCount = 0;
+    int64_t totalI2cTime = 0;
+    int64_t totalMathTime = 0;
+    int64_t maxI2cTime = 0; // Pour capter le pire scénario (jitter)
 
     ESP_LOGI(TAG_MPU9250, "Sensor task started");
+
     while (true)
     {
         // Calculate time delta
         int64_t now = esp_timer_get_time();
-        float dt = (now - sensor->lastProcessTime) / 1000000.0f;
-        if (dt <= 0.0f)
-        {
-            vTaskDelay(pdMS_TO_TICKS(1));
-            continue;
-        }
-        sensor->lastProcessTime = now;
+        float dt = (now - lastTime) / 1000000.0f;
+        lastTime = now;
+
+        // No division by 0
+        if (dt <= 0.0f) dt = 0.01f;
 
         // Read sensor data
-        sensor->readAllSensors();
+        // sensor->readAllSensors();
+        Vector3 loc_accel = {0.0f, 0.0f, 0.0f};
+        Vector3 loc_gyro  = {0.0f, 0.0f, 0.0f};
+        Vector3 loc_mag   = {0.0f, 0.0f, 0.0f};
+        float loc_temp = 0.0f;
+        bool newDataReady = false;
 
-        // Process measurements if not calibrating
-        if (sensor->calibStatus != CALIBRATING)
+        int64_t startI2c = esp_timer_get_time();
+
+        // (14 octets : 6 Accel, 2 Temp, 6 Gyro)
+        // Registre de départ : 0x3B (ACCEL_XOUT_H)
+        uint8_t buffer[14];
+        if (sensor->readRegisters(MPU9250_ADDR, 0x3B, 14, buffer) == ESP_OK)
         {
-            if (xSemaphoreTake(sensor->dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+            int16_t ax = (buffer[0] << 8) | buffer[1];
+            int16_t ay = (buffer[2] << 8) | buffer[3];
+            int16_t az = (buffer[4] << 8) | buffer[5];
+            int16_t temp = (buffer[6] << 8) | buffer[7];
+            int16_t gx = (buffer[8] << 8) | buffer[9];
+            int16_t gy = (buffer[10] << 8) | buffer[11];
+            int16_t gz = (buffer[12] << 8) | buffer[13];
+
+            // Applied offsets and invert
+            loc_accel.x = sensor->invertAxis.x * ((ax / 8192.0f) - sensor->accelOffset.x);
+            loc_accel.y = sensor->invertAxis.y * ((ay / 8192.0f) - sensor->accelOffset.y);
+            loc_accel.z = sensor->invertAxis.z * ((az / 8192.0f) - sensor->accelOffset.z);
+
+            loc_temp = (temp / 333.87f) + 21.0f;
+
+            loc_gyro.x = sensor->invertAxis.x * ((gx / 32.8f) - sensor->gyroOffset.x);
+            loc_gyro.y = sensor->invertAxis.y * ((gy / 32.8f) - sensor->gyroOffset.y);
+            loc_gyro.z = sensor->invertAxis.z * ((gz / 32.8f) - sensor->gyroOffset.z);
+
+            newDataReady = true;
+        }
+
+        // Magnetometer
+        if (sensor->magAvailable)
+        {
+            uint8_t st1;
+            // If data ready
+            if (sensor->readRegisters(AK8963_ADDR, 0x02, 1, &st1) == ESP_OK && (st1 & 0x01))
             {
-                sensor->processMeasurements(dt);
-                xSemaphoreGive(sensor->dataMutex);
-                //ESP_LOGI(TAG_MPU9250, "Orientation: Roll=%.2f, Pitch=%.2f, Yaw=%.2f", sensor->orientation.roll, sensor->orientation.pitch, sensor->orientation.yaw);
+                uint8_t magBuf[7];
+                // 7 octets : 6 pour XYZ + 1 octet final state (ST2)
+                if (sensor->readRegisters(AK8963_ADDR, 0x03, 7, magBuf) == ESP_OK)
+                {
+                    // Check overflow mag
+                    if (!(magBuf[6] & 0x08)) 
+                    {
+                        int16_t mx = (magBuf[1] << 8) | magBuf[0];
+                        int16_t my = (magBuf[3] << 8) | magBuf[2];
+                        int16_t mz = (magBuf[5] << 8) | magBuf[4];
+
+                        float adjX = (((float)sensor->magAdjustValues[0] - 128.0f) / 256.0f + 1.0f);
+                        float adjY = (((float)sensor->magAdjustValues[1] - 128.0f) / 256.0f + 1.0f);
+                        float adjZ = (((float)sensor->magAdjustValues[2] - 128.0f) / 256.0f + 1.0f);
+
+                        loc_mag.x = sensor->invertAxis.x * (((mx * 0.15f * adjX) - sensor->magOffset.x) * sensor->magScale.x);
+                        loc_mag.y = sensor->invertAxis.y * (((my * 0.15f * adjY) - sensor->magOffset.y) * sensor->magScale.y);
+                        loc_mag.z = sensor->invertAxis.z * (((mz * 0.15f * adjZ) - sensor->magOffset.z) * sensor->magScale.z);
+                    }
+                }
             }
         }
 
-        // Wait for next sample
+        int64_t endI2c = esp_timer_get_time();
+        int64_t currentI2cTime = endI2c - startI2c;
+        totalI2cTime += currentI2cTime;
+        if (currentI2cTime > maxI2cTime) maxI2cTime = currentI2cTime;
+
+        int64_t startMath = esp_timer_get_time();
+
+        if (newDataReady)
+        {
+            if (xSemaphoreTake(sensor->dataMutex, pdMS_TO_TICKS(5)) == pdTRUE)
+            {
+                sensor->accel = loc_accel;
+                sensor->gyro = loc_gyro;
+                sensor->temperature = loc_temp;
+
+                if (sensor->magAvailable) {
+                    sensor->mag = loc_mag;
+                }
+
+                // Process measurements if not calibrating
+                if (sensor->calibStatus != CALIBRATING)
+                {
+                    sensor->processMeasurements(dt);
+                }
+
+                xSemaphoreGive(sensor->dataMutex);
+            }
+        }
+
+        totalMathTime += (esp_timer_get_time() - startMath);
+
+        loopCount++;
+        if (loopCount >= 100) // À 100Hz, ça fait 1 fois par seconde
+        {
+            ESP_LOGI("PROFILER", "--- Profiling sur 100 boucles ---");
+            ESP_LOGI("PROFILER", "I2C  (Moy)  : %lld us", totalI2cTime / 100);
+            ESP_LOGI("PROFILER", "I2C  (Max)  : %lld us", maxI2cTime);
+            ESP_LOGI("PROFILER", "Math (Moy)  : %lld us", totalMathTime / 100);
+            ESP_LOGI("PROFILER", "Temps Libre : %lld us (sur 10000 us dispos par cycle)", 10000 - (totalI2cTime/100) - (totalMathTime/100));
+            
+            // Reset des compteurs
+            loopCount = 0;
+            totalI2cTime = 0;
+            totalMathTime = 0;
+            maxI2cTime = 0;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(10)); // 100 Hz
     }
 }
