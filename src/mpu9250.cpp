@@ -1,5 +1,6 @@
-#include <mpu9250.h>
+#include "mpu9250.h"
 #define I2C_MASTER_NUM I2C_NUM_0
+
 // Implementation
 MPU9250::MPU9250()
     : i2cPort(I2C_NUM_0),
@@ -498,8 +499,8 @@ void MPU9250::sensorTask(void *arg)
     while (true)
     {
         // Calculate time delta
-        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        float dt = (now - sensor->lastProcessTime) / 1000.0f;
+        int64_t now = esp_timer_get_time();
+        float dt = (now - sensor->lastProcessTime) / 1000000.0f;
         if (dt <= 0.0f)
         {
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -790,6 +791,6 @@ esp_err_t MPU9250::setInvertAxis(bool invertX, bool invertY, bool invertZ)
 
 esp_err_t MPU9250::setSwitchRollPitch(bool switchRollPitch)
 {
-    switchRollPitch = switchRollPitch;
+    this->switchRollPitch = switchRollPitch;
     return ESP_OK;
 }
