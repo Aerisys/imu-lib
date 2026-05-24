@@ -9,6 +9,7 @@
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "imu_sensor.h"
+#include <atomic>
 #include <math.h>
 #include <string.h>
 #include <cfloat>
@@ -270,6 +271,20 @@ public:
     esp_err_t setSwitchRollPitch(bool switchRollPitch) override;
 
     // -------------------------------------------------------------------------
+    // Atomic snapshot + new-sample signalling — overrides of IMUSensor.
+    // -------------------------------------------------------------------------
+    // `getSnapshot()` reads a coherent set via a seqlock published by the
+    // sensor task (no mutex on the reader path). Worst-case it loops a few
+    // times if the reader was preempted exactly during a writer publish.
+    //
+    // `waitForNewSample()` blocks the calling task on an internal binary
+    // semaphore that the sensor task signals on every publish. Because the
+    // semaphore is binary (not counting), a slow consumer never accumulates
+    // backlog: it always wakes up to the most recent sample.
+    SampleBundle getSnapshot() override;
+    esp_err_t    waitForNewSample(uint32_t timeoutMs) override;
+
+    // -------------------------------------------------------------------------
     // Calibration persistence (NVS)
     // -------------------------------------------------------------------------
     // The consumer project is responsible for initialising NVS once at startup
@@ -353,7 +368,21 @@ private:
     gpio_num_t intPin;
 
     TaskHandle_t taskHandle;
+    // dataMutex still guards INTERNAL mutations (calibration writes,
+    // setters). It is NEVER taken on the consumer read path: that goes
+    // through the seqlock-backed `publishedBundle` below.
     SemaphoreHandle_t dataMutex;
+    // Binary semaphore given by the sensor task on every successful publish.
+    // Consumers block on this via `waitForNewSample()`. Binary (not
+    // counting) so a slow consumer never builds up a backlog.
+    SemaphoreHandle_t sampleSem;
+
+    // ---- Seqlock-protected published snapshot ------------------------------
+    // The writer (sensor task) bumps `bundleSeq` once before and once after
+    // writing `publishedBundle`. Readers loop until they see two equal even
+    // values around their copy. One writer + N readers, lock-free reads.
+    SampleBundle              publishedBundle;
+    std::atomic<uint32_t>     bundleSeq;
 
     // Sensor Data
     Vector3 accel;

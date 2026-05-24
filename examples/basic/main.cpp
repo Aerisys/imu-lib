@@ -106,17 +106,44 @@ extern "C" void app_main()
         return;
     }
 
-    // 3. Consume the quaternion from the control loop. We deliberately go
-    //    through the abstract IMUSensor interface here to illustrate that
-    //    consumer code (PID, telemetry, etc.) does not need to know which
-    //    concrete chip is wired in. Swap the line below to a future ICM-*
-    //    implementation and the loop is unchanged.
+    // 3. Consume samples from the control loop.
+    //
+    //    We go through the abstract IMUSensor interface so this loop does
+    //    not need to know which concrete chip is wired in (swap the type
+    //    above to a future ICM-* and this stays unchanged).
+    //
+    //    Two improvements vs. the old "poll every 500 ms" pattern:
+    //      - waitForNewSample() blocks until the sensor task publishes a
+    //        fresh bundle, so the loop runs exactly in lockstep with the
+    //        1 kHz sample rate instead of guessing a period.
+    //      - getSnapshot() returns every value as a coherent set taken at
+    //        the same instant (one seqlock read), so accel/gyro/quaternion
+    //        all come from the same iteration — important for PID stability.
     IMUSensor* sensor = &imu;
 
+    uint32_t logEvery = 0;
     while (true)
     {
-        IMUSensor::Quaternion q = sensor->getQuaternion();
-        ESP_LOGI("APP", "q = [w=%.3f x=%.3f y=%.3f z=%.3f]", q.w, q.x, q.y, q.z);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        if (sensor->waitForNewSample(100) != ESP_OK)
+        {
+            ESP_LOGW("APP", "No IMU sample in 100 ms — sensor stuck?");
+            continue;
+        }
+
+        IMUSensor::SampleBundle s = sensor->getSnapshot();
+
+        // ---- Drone control loop would run its PID here, using s.gyro,
+        //      s.quaternion, etc. The loop is now timed BY the IMU.
+
+        // Throttle log output (otherwise 1 kHz of ESP_LOGI floods the UART).
+        if (++logEvery >= 1000)
+        {
+            logEvery = 0;
+            ESP_LOGI("APP",
+                     "q=[%.3f %.3f %.3f %.3f]  gyro=[%.1f %.1f %.1f] deg/s  T=%.1fC",
+                     s.quaternion.w, s.quaternion.x, s.quaternion.y, s.quaternion.z,
+                     s.gyro.x, s.gyro.y, s.gyro.z,
+                     s.temperature);
+        }
     }
 }
