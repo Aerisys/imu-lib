@@ -76,17 +76,23 @@ extern "C" void app_main()
     ESP_LOGI("APP", "MPU9250 initialized");
 
     // Calibration is auto-loaded from NVS by init(). Only run a fresh
-    // calibration if nothing was found on disk — otherwise we'd uselessly
-    // burn 10 s of immobility on every boot.
+    // gyro+accel calibration if nothing was found on disk — otherwise we'd
+    // uselessly burn 10 s of immobility on every boot.
+    //
+    // The mag calibration is NOT done automatically: it requires the user
+    // to physically rotate the sensor through every orientation for 30 s.
+    // Trigger `imu.calibrateMag()` from a dedicated boot mode (e.g. a long
+    // button press at power-on, or via the drone configurator) when you
+    // actually want to recalibrate it.
     if (imu.getCalibrationStatus() != MPU9250::CALIBRATED)
     {
-        err = imu.calibrate();
+        err = imu.calibrateGyroAccel();
         if (err != ESP_OK)
         {
-            ESP_LOGE("APP", "Failed to start calibration");
+            ESP_LOGE("APP", "Failed to start gyro/accel calibration");
             return;
         }
-        ESP_LOGI("APP", "Calibration started (will be persisted to NVS on completion)");
+        ESP_LOGI("APP", "Gyro/Accel calibration started (~10 s, keep still)");
     }
     else
     {

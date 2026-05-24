@@ -979,28 +979,34 @@ esp_err_t MPU9250::startSensorTask()
 
 esp_err_t MPU9250::calibrate()
 {
+    // IMUSensor interface contract: this is the default "safe" calibration
+    // every drone bring-up needs. It only handles gyro+accel — the mag
+    // calibration requires user rotation and is a separate explicit call.
+    return calibrateGyroAccel();
+}
+
+esp_err_t MPU9250::calibrateGyroAccel()
+{
     if (calibStatus == CALIBRATING)
     {
         ESP_LOGW(TAG_MPU9250, "Calibration already in progress");
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Reset calibration values
-    resetCalibration();
-
-    // Start calibration in another task to avoid blocking
+    resetGyroAccelOffsets();
     calibStatus = CALIBRATING;
 
-    // Create a task for calibration
+    // Background task — performGyroAccelCalibration takes ~10 s and we do
+    // not want to block the caller.
     TaskHandle_t calibTaskHandle = NULL;
     BaseType_t ret = xTaskCreate(
         [](void *arg)
         {
             MPU9250 *sensor = static_cast<MPU9250 *>(arg);
-            sensor->performCalibration();
+            sensor->performGyroAccelCalibration();
             vTaskDelete(NULL);
         },
-        "mpu9250_calib",
+        "mpu9250_ga_cal",
         4096,
         this,
         5,
@@ -1008,89 +1014,101 @@ esp_err_t MPU9250::calibrate()
 
     if (ret != pdPASS)
     {
-        ESP_LOGE(TAG_MPU9250, "Failed to create calibration task");
+        ESP_LOGE(TAG_MPU9250, "Failed to create gyro/accel calibration task");
         calibStatus = NOT_CALIBRATED;
         return ESP_FAIL;
     }
-
     return ESP_OK;
 }
 
-void MPU9250::resetCalibration()
+esp_err_t MPU9250::calibrateMag()
 {
-    ESP_LOGI(TAG_MPU9250, "Resetting calibration values");
+    if (!magAvailable)
+    {
+        ESP_LOGW(TAG_MPU9250, "calibrateMag: no magnetometer detected at init");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    // calibStatus is intentionally NOT mutated here: the gyro+accel state
+    // remains whatever it was. A mag-only calibration is an orthogonal
+    // operation; consumers waiting on getCalibrationStatus() see no change.
+
+    resetMagOffsets();
+
+    TaskHandle_t calibTaskHandle = NULL;
+    BaseType_t ret = xTaskCreate(
+        [](void *arg)
+        {
+            MPU9250 *sensor = static_cast<MPU9250 *>(arg);
+            sensor->performMagCalibration();
+            vTaskDelete(NULL);
+        },
+        "mpu9250_mag_cal",
+        4096,
+        this,
+        5,
+        &calibTaskHandle);
+
+    if (ret != pdPASS)
+    {
+        ESP_LOGE(TAG_MPU9250, "Failed to create mag calibration task");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+void MPU9250::resetGyroAccelOffsets()
+{
+    ESP_LOGI(TAG_MPU9250, "Resetting gyro/accel calibration values");
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
     {
-        accelOffset      = {0, 0, 0};
-        gyroOffset       = {0, 0, 0};
-        gyroCalibTemp    = 25.0f;
-        // Note: gyroTempCompCoeff is preserved here. resetCalibration is
-        // called from calibrate() to prepare for a fresh measurement; the
-        // user-supplied temperature coefficient stays valid across re-runs.
-        magOffset        = {0, 0, 0};
-        magScale         = {1.0f, 1.0f, 1.0f};
+        accelOffset   = {0, 0, 0};
+        gyroOffset    = {0, 0, 0};
+        gyroCalibTemp = 25.0f;
+        // Note: gyroTempCompCoeff is preserved across re-runs (user-supplied,
+        // expensive to remeasure).
         xSemaphoreGive(dataMutex);
-        ESP_LOGI(TAG_MPU9250, "Calibration values reset");
     }
 }
 
-void MPU9250::performCalibration()
+void MPU9250::resetMagOffsets()
 {
-    ESP_LOGI(TAG_MPU9250, "Starting calibration, keep the sensor still...");
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Let sensor stabilize
+    ESP_LOGI(TAG_MPU9250, "Resetting magnetometer calibration values");
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        magOffset = {0, 0, 0};
+        magScale  = {1.0f, 1.0f, 1.0f};
+        xSemaphoreGive(dataMutex);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// performGyroAccelCalibration — sensor IMMOBILE for 10 seconds.
+// -----------------------------------------------------------------------------
+void MPU9250::performGyroAccelCalibration()
+{
+    ESP_LOGI(TAG_MPU9250, "Gyro/Accel calibration: keep the sensor still on a flat surface...");
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Let sensor settle thermally
 
     Vector3 accelSum = {0, 0, 0};
-    Vector3 gyroSum = {0, 0, 0};
-    Vector3 magMin = {FLT_MAX, FLT_MAX, FLT_MAX};
-    Vector3 magMax = {FLT_MIN, FLT_MIN, FLT_MIN};
+    Vector3 gyroSum  = {0, 0, 0};
 
-    // Collect samples
     for (int i = 0; i < CALIBRATION_SAMPLES; i++)
     {
-        // Read raw values without applying offsets
-        float ax = invertAxis.x * readAccel(0);
-        float ay = invertAxis.y * readAccel(2);
-        float az = invertAxis.z * readAccel(4);
-        float gx = invertAxis.x * readGyro(0);
-        float gy = invertAxis.y * readGyro(2);
-        float gz = invertAxis.z * readGyro(4);
-
-        accelSum.x += ax;
-        accelSum.y += ay;
-        accelSum.z += az;
-        gyroSum.x += gx;
-        gyroSum.y += gy;
-        gyroSum.z += gz;
-
-        // For magnetometer, record min/max values while rotating the sensor
-        if (magAvailable)
-        {
-            float mx = invertAxis.x * readMag(0);
-            float my = invertAxis.y * readMag(2);
-            float mz = invertAxis.z * readMag(4);
-
-            magMin.x = min(magMin.x, mx);
-            magMin.y = min(magMin.y, my);
-            magMin.z = min(magMin.z, mz);
-
-            magMax.x = max(magMax.x, mx);
-            magMax.y = max(magMax.y, my);
-            magMax.z = max(magMax.z, mz);
-        }
+        accelSum.x += invertAxis.x * readAccel(0);
+        accelSum.y += invertAxis.y * readAccel(2);
+        accelSum.z += invertAxis.z * readAccel(4);
+        gyroSum.x  += invertAxis.x * readGyro(0);
+        gyroSum.y  += invertAxis.y * readGyro(2);
+        gyroSum.z  += invertAxis.z * readGyro(4);
 
         if (i % 100 == 0)
         {
-            ESP_LOGI(TAG_MPU9250, "Calibration progress: %d%%", i * 100 / CALIBRATION_SAMPLES);
+            ESP_LOGI(TAG_MPU9250, "Gyro/Accel calibration progress: %d%%", i * 100 / CALIBRATION_SAMPLES);
         }
-
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    // Capture the temperature at the end of the calibration window. The gyro
-    // bias drift compensation uses this as the reference point: at run-time
-    // the effective offset = gyroOffset + coeff * (currentTemp - calibTemp).
-    // Reading once here is sufficient — the chip has thermally stabilised
-    // during the 10-second still period.
+    // Capture temperature once at the end (chip thermally stable by now).
     float calibTemp = 25.0f;
     {
         uint8_t rawData[2] = {0};
@@ -1103,67 +1121,118 @@ void MPU9250::performCalibration()
 
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
     {
-        // Calculate average offsets
-        gyroOffset.x = gyroSum.x / CALIBRATION_SAMPLES;
-        gyroOffset.y = gyroSum.y / CALIBRATION_SAMPLES;
-        gyroOffset.z = gyroSum.z / CALIBRATION_SAMPLES;
+        gyroOffset.x  = gyroSum.x / CALIBRATION_SAMPLES;
+        gyroOffset.y  = gyroSum.y / CALIBRATION_SAMPLES;
+        gyroOffset.z  = gyroSum.z / CALIBRATION_SAMPLES;
         gyroCalibTemp = calibTemp;
-        // gyroTempCompCoeff is NOT touched here: a user-supplied coefficient
-        // from setGyroTempCompCoeff() is preserved across re-calibrations.
+        // gyroTempCompCoeff preserved (user-supplied via setGyroTempCompCoeff).
 
-        // For accelerometer, Z-axis should read 1g (gravity)
         accelOffset.x = accelSum.x / CALIBRATION_SAMPLES;
         accelOffset.y = accelSum.y / CALIBRATION_SAMPLES;
-        accelOffset.z = (accelSum.z / CALIBRATION_SAMPLES) - 1.0f; // Subtract gravity
+        accelOffset.z = (accelSum.z / CALIBRATION_SAMPLES) - 1.0f; // subtract 1g gravity
 
-        // For magnetometer, compute hard-iron (offset) and soft-iron (scale) corrections
-        if (magAvailable)
-        {
-            magOffset.x = (magMax.x + magMin.x) / 2.0f;
-            magOffset.y = (magMax.y + magMin.y) / 2.0f;
-            magOffset.z = (magMax.z + magMin.z) / 2.0f;
-
-            float magDelta = max(max(magMax.x - magMin.x, magMax.y - magMin.y), magMax.z - magMin.z);
-
-            if (magDelta > 0)
-            {
-                magScale.x = (magMax.x - magMin.x) / magDelta;
-                magScale.y = (magMax.y - magMin.y) / magDelta;
-                magScale.z = (magMax.z - magMin.z) / magDelta;
-            }
-        }
-
-        // Reset integrated values
-        gyroIntegrated = {0, 0, 0};
+        // Reset filter integrators so they don't carry pre-calibration error
+        gyroIntegrated      = {0, 0, 0};
         mahonyIntegralError = {0, 0, 0};
 
-        // Update calibration status
+        // calibStatus advances to CALIBRATED here even if mag has never been
+        // calibrated: gyro+accel is the minimum to safely produce attitude.
+        // The mag stays at its previous offsets/scales (zero/unity if never
+        // calibrated), in which case the Mahony 9-DOF falls back to 6-DOF
+        // naturally (zero mag vector skipped, see updateMahonyFilter).
         calibStatus = CALIBRATED;
 
         xSemaphoreGive(dataMutex);
     }
 
-    ESP_LOGI(TAG_MPU9250, "Calibration complete");
+    ESP_LOGI(TAG_MPU9250, "Gyro/Accel calibration complete");
+    ESP_LOGI(TAG_MPU9250, "  Accel offsets: %.3f, %.3f, %.3f", accelOffset.x, accelOffset.y, accelOffset.z);
+    ESP_LOGI(TAG_MPU9250, "  Gyro offsets:  %.3f, %.3f, %.3f (calibTemp=%.1f degC)",
+             gyroOffset.x, gyroOffset.y, gyroOffset.z, gyroCalibTemp);
 
-    // Log calibration results
-    ESP_LOGI(TAG_MPU9250, "Accel offsets: %.3f, %.3f, %.3f", accelOffset.x, accelOffset.y, accelOffset.z);
-    ESP_LOGI(TAG_MPU9250, "Gyro offsets:  %.3f, %.3f, %.3f (calibTemp=%.1f degC)", gyroOffset.x, gyroOffset.y, gyroOffset.z, gyroCalibTemp);
-    if (magAvailable)
-    {
-        ESP_LOGI(TAG_MPU9250, "Mag offsets:   %.3f, %.3f, %.3f", magOffset.x, magOffset.y, magOffset.z);
-        ESP_LOGI(TAG_MPU9250, "Mag scale:     %.3f, %.3f, %.3f", magScale.x, magScale.y, magScale.z);
-    }
-
-    // Persist so subsequent boots skip the 10-second still window.
     esp_err_t saveErr = saveCalibration();
-    if (saveErr == ESP_OK)
+    if (saveErr != ESP_OK)
+        ESP_LOGW(TAG_MPU9250, "saveCalibration failed (err=%d) — RAM-only", saveErr);
+}
+
+// -----------------------------------------------------------------------------
+// performMagCalibration — sensor ROTATED in figure-8 for 30 seconds.
+// -----------------------------------------------------------------------------
+void MPU9250::performMagCalibration()
+{
+    if (!magAvailable)
     {
-        ESP_LOGI(TAG_MPU9250, "Calibration saved to NVS");
+        ESP_LOGW(TAG_MPU9250, "Mag calibration requested but no magnetometer detected — skipping");
+        return;
     }
-    else
+
+    ESP_LOGI(TAG_MPU9250, "Mag calibration: rotate the sensor through ALL orientations in a figure-8");
+    ESP_LOGI(TAG_MPU9250, "  (slow, sustained motion for ~30 seconds — cover roll, pitch and yaw)");
+    vTaskDelay(pdMS_TO_TICKS(2000)); // give the user time to start moving
+
+    Vector3 magMin = { FLT_MAX,  FLT_MAX,  FLT_MAX};
+    Vector3 magMax = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+
+    for (int i = 0; i < MAG_CALIBRATION_SAMPLES; i++)
     {
-        ESP_LOGW(TAG_MPU9250, "saveCalibration failed (err=%d) — offsets active in RAM only", saveErr);
+        float mx = invertAxis.x * readMag(0);
+        float my = invertAxis.y * readMag(2);
+        float mz = invertAxis.z * readMag(4);
+
+        // Skip the (0,0,0) sentinel from readMag when DATA_READY is not set
+        if (mx != 0.0f || my != 0.0f || mz != 0.0f)
+        {
+            magMin.x = min(magMin.x, mx);
+            magMin.y = min(magMin.y, my);
+            magMin.z = min(magMin.z, mz);
+
+            magMax.x = max(magMax.x, mx);
+            magMax.y = max(magMax.y, my);
+            magMax.z = max(magMax.z, mz);
+        }
+
+        if (i % 300 == 0)
+        {
+            ESP_LOGI(TAG_MPU9250, "Mag calibration progress: %d%%", i * 100 / MAG_CALIBRATION_SAMPLES);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
+
+    // Sanity: if min == max on any axis the user did not actually rotate.
+    // Refuse to apply a degenerate calibration that would zero out a scale.
+    const float spanX = magMax.x - magMin.x;
+    const float spanY = magMax.y - magMin.y;
+    const float spanZ = magMax.z - magMin.z;
+    if (spanX <= 0.0f || spanY <= 0.0f || spanZ <= 0.0f)
+    {
+        ESP_LOGE(TAG_MPU9250, "Mag calibration failed: zero span on at least one axis (rotate harder next time)");
+        return;
+    }
+
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        // Hard-iron offset = midpoint of each axis (DC bias from nearby ferro).
+        magOffset.x = (magMax.x + magMin.x) / 2.0f;
+        magOffset.y = (magMax.y + magMin.y) / 2.0f;
+        magOffset.z = (magMax.z + magMin.z) / 2.0f;
+
+        // Soft-iron scale = per-axis span normalized to the widest axis.
+        // The widest axis becomes 1.0, narrower axes get >1.0 to stretch
+        // their range and approximate a spherical field response.
+        const float magDelta = max(max(spanX, spanY), spanZ);
+        magScale.x = spanX / magDelta;
+        magScale.y = spanY / magDelta;
+        magScale.z = spanZ / magDelta;
+        xSemaphoreGive(dataMutex);
+    }
+
+    ESP_LOGI(TAG_MPU9250, "Mag calibration complete");
+    ESP_LOGI(TAG_MPU9250, "  Mag offsets: %.3f, %.3f, %.3f", magOffset.x, magOffset.y, magOffset.z);
+    ESP_LOGI(TAG_MPU9250, "  Mag scale:   %.3f, %.3f, %.3f", magScale.x, magScale.y, magScale.z);
+
+    esp_err_t saveErr = saveCalibration();
+    if (saveErr != ESP_OK)
+        ESP_LOGW(TAG_MPU9250, "saveCalibration failed (err=%d) — RAM-only", saveErr);
 }
 
 // Individual getters now go through the lock-free snapshot path so the
