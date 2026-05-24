@@ -72,11 +72,24 @@ extern "C" void app_main()
     ESP_LOGI("APP", "Calibration started");
 
     imu.setFilterMode(MPU9250::MAHONY);
+    // Optional: tune Mahony gains for this airframe.
+    //   Kp around 1.0 gives a faster correction (more responsive but noisier);
+    //   Ki kept at 0 to avoid integral windup during aggressive maneuvers.
+    imu.setMahonyGains(1.0f, 0.0f);
 
     err = imu.startSensorTask();
     if (err != ESP_OK)
     {
         ESP_LOGE("APP", "Failed to start sensor task");
         return;
+    }
+
+    // 3. Consume the quaternion from the control loop. On a drone, prefer the
+    //    quaternion over Euler angles to avoid gimbal lock during loops/flips.
+    while (true)
+    {
+        MPU9250::Quaternion q = imu.getQuaternion();
+        ESP_LOGI("APP", "q = [w=%.3f x=%.3f y=%.3f z=%.3f]", q.w, q.x, q.y, q.z);
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }

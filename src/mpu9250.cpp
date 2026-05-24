@@ -30,7 +30,9 @@ MPU9250::MPU9250()
       successCount(0),
       magAvailable(false),
       filterMode(COMPLEMENTARY),
-      q{1.0f, 0.0f, 0.0f, 0.0f} // Mahony quaternion init
+      q{1.0f, 0.0f, 0.0f, 0.0f}, // Identity quaternion (no rotation)
+      mahonyKp(MAHONY_KP),
+      mahonyKi(MAHONY_KI)
 {
     memset(magAdjustValues, 0, sizeof(magAdjustValues));
     dataMutex = xSemaphoreCreateMutex();
@@ -433,51 +435,105 @@ void MPU9250::updateComplementaryFilter(float dt)
 
 void MPU9250::updateMahonyFilter(float dt)
 {
+    // -------------------------------------------------------------------------
+    // Mahony AHRS — 9-DOF when magnetometer is valid, 6-DOF fallback otherwise.
+    // -------------------------------------------------------------------------
+    // Reference: R. Mahony, T. Hamel, J.-M. Pflimlin, "Nonlinear Complementary
+    // Filters on the Special Orthogonal Group", IEEE T-AC 2008. The numerical
+    // recipe below follows the canonical x-io Technologies implementation
+    // (Madgwick/Mahony AHRS) with one error vector built from BOTH the
+    // accelerometer (gravity reference) AND the magnetometer (horizontal
+    // magnetic-field reference). Without the mag term the yaw is only
+    // integrated from the gyro and drifts unbounded — that was the previous
+    // bug. With the mag term, yaw is locked to magnetic north.
+    // -------------------------------------------------------------------------
+
     // Convert gyro to rad/s
     float gx = gyro.x * DEG_TO_RAD;
     float gy = gyro.y * DEG_TO_RAD;
     float gz = gyro.z * DEG_TO_RAD;
 
-    // Unpack quaternion state
+    // Unpack quaternion state into locals (cheaper than repeated field access)
     float q0 = q.w;
     float q1 = q.x;
     float q2 = q.y;
     float q3 = q.z;
 
-    // Normalize accelerometer measurement
-    float norm = sqrtf(accel.x*accel.x + accel.y*accel.y + accel.z*accel.z);
-    if (norm == 0.0f) return; // avoid division by zero
-    norm = 1.0f / norm;
-    float ax = accel.x * norm;
-    float ay = accel.y * norm;
-    float az = accel.z * norm;
+    // -- Normalize accelerometer (must have non-zero magnitude) ----------------
+    float accNorm = sqrtf(accel.x*accel.x + accel.y*accel.y + accel.z*accel.z);
+    if (accNorm == 0.0f) return; // gravity reference unusable -> skip update
+    float invAccNorm = 1.0f / accNorm;
+    float ax = accel.x * invAccNorm;
+    float ay = accel.y * invAccNorm;
+    float az = accel.z * invAccNorm;
 
-    // Estimated direction of gravity
+    // -- Estimated direction of gravity in body frame --------------------------
     float vx = 2.0f * (q1*q3 - q0*q2);
     float vy = 2.0f * (q0*q1 + q2*q3);
     float vz = q0*q0 - q1*q1 - q2*q2 + q3*q3;
 
-    // Error is cross product between measured and estimated gravity
+    // -- Error from accelerometer (cross product gravity reference) ------------
     float ex = (ay*vz - az*vy);
     float ey = (az*vx - ax*vz);
     float ez = (ax*vy - ay*vx);
 
-    // Integral feedback
-    if (MAHONY_KI > 0.0f) {
-        mahonyIntegralError.x += ex * MAHONY_KI * dt;
-        mahonyIntegralError.y += ey * MAHONY_KI * dt;
-        mahonyIntegralError.z += ez * MAHONY_KI * dt;
+    // -- Add magnetometer error if available and valid -------------------------
+    // We compute the world-frame magnetic field expected from the current
+    // attitude, then form the cross product with the measured mag direction.
+    // When the magnetometer is missing or returns a zero vector (e.g. during
+    // calibration or hardware fault), we fall back to 6-DOF behaviour.
+    if (magAvailable)
+    {
+        float magNorm = sqrtf(mag.x*mag.x + mag.y*mag.y + mag.z*mag.z);
+        if (magNorm > 0.0f)
+        {
+            float invMagNorm = 1.0f / magNorm;
+            float mx = mag.x * invMagNorm;
+            float my = mag.y * invMagNorm;
+            float mz = mag.z * invMagNorm;
+
+            // Project measured magnetic field into the world frame (h = q * m * q*)
+            float hx = 2.0f * (mx*(0.5f - q2*q2 - q3*q3) + my*(q1*q2 - q0*q3) + mz*(q1*q3 + q0*q2));
+            float hy = 2.0f * (mx*(q1*q2 + q0*q3) + my*(0.5f - q1*q1 - q3*q3) + mz*(q2*q3 - q0*q1));
+            float hz = 2.0f * (mx*(q1*q3 - q0*q2) + my*(q2*q3 + q0*q1) + mz*(0.5f - q1*q1 - q2*q2));
+
+            // Reference magnetic field: project onto X-Z plane of the world frame
+            // (horizontal component = bx, vertical = bz). This is what the field
+            // SHOULD look like in world coordinates given the current attitude.
+            float bx = sqrtf(hx*hx + hy*hy);
+            float bz = hz;
+
+            // Estimated direction of magnetic field in body frame
+            float wx = 2.0f * (bx*(0.5f - q2*q2 - q3*q3) + bz*(q1*q3 - q0*q2));
+            float wy = 2.0f * (bx*(q1*q2 - q0*q3) + bz*(q0*q1 + q2*q3));
+            float wz = 2.0f * (bx*(q0*q2 + q1*q3) + bz*(0.5f - q1*q1 - q2*q2));
+
+            // Cross product (measured x estimated) — adds yaw correction
+            ex += (my*wz - mz*wy);
+            ey += (mz*wx - mx*wz);
+            ez += (mx*wy - my*wx);
+        }
+    }
+
+    // -- Integral feedback (compensates slow gyro bias drift) ------------------
+    if (mahonyKi > 0.0f) {
+        mahonyIntegralError.x += ex * mahonyKi * dt;
+        mahonyIntegralError.y += ey * mahonyKi * dt;
+        mahonyIntegralError.z += ez * mahonyKi * dt;
         gx += mahonyIntegralError.x;
         gy += mahonyIntegralError.y;
         gz += mahonyIntegralError.z;
+    } else {
+        // Prevent windup if Ki is later re-enabled after being zero
+        mahonyIntegralError = {0.0f, 0.0f, 0.0f};
     }
 
-    // Proportional feedback
-    gx += MAHONY_KP * ex;
-    gy += MAHONY_KP * ey;
-    gz += MAHONY_KP * ez;
+    // -- Proportional feedback -------------------------------------------------
+    gx += mahonyKp * ex;
+    gy += mahonyKp * ey;
+    gz += mahonyKp * ez;
 
-    // Integrate rate of change of quaternion
+    // -- Integrate quaternion derivative ---------------------------------------
     float half_dt = 0.5f * dt;
     float qa = q0;
     float qb = q1;
@@ -489,13 +545,14 @@ void MPU9250::updateMahonyFilter(float dt)
     q2 += ( qa * gy - qb * gz + qd * gx) * half_dt;
     q3 += ( qa * gz + qb * gy - qc * gx) * half_dt;
 
-    // Normalize quaternion
-    norm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
-    norm = 1.0f / norm;
-    q.w = q0 * norm;
-    q.x = q1 * norm;
-    q.y = q2 * norm;
-    q.z = q3 * norm;
+    // -- Normalize quaternion --------------------------------------------------
+    float qNorm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+    if (qNorm == 0.0f) return; // numerical pathology, leave previous q intact
+    float invQNorm = 1.0f / qNorm;
+    q.w = q0 * invQNorm;
+    q.x = q1 * invQNorm;
+    q.y = q2 * invQNorm;
+    q.z = q3 * invQNorm;
 
     // Convert quaternion to Euler angles (deg)
     if (switchRollPitch)
@@ -556,6 +613,12 @@ void MPU9250::sensorTask(void *arg)
         Vector3 loc_mag   = {0.0f, 0.0f, 0.0f};
         float loc_temp = 0.0f;
         bool newDataReady = false;
+        // Tracks whether THIS iteration produced a fresh magnetometer sample.
+        // The AK8963 runs at 100 Hz while the MPU is read at 1 kHz: only one
+        // in ten iterations gets new mag data. Without this flag we used to
+        // overwrite the shared `sensor->mag` with zeros on every non-fresh
+        // iteration, which broke the Mahony 9-DOF correction completely.
+        bool magNewSample = false;
 
         int64_t startI2c = esp_timer_get_time();
 
@@ -611,6 +674,7 @@ void MPU9250::sensorTask(void *arg)
                         loc_mag.x = sensor->invertAxis.x * (((mx * 0.15f * adjX) - sensor->magOffset.x) * sensor->magScale.x);
                         loc_mag.y = sensor->invertAxis.y * (((my * 0.15f * adjY) - sensor->magOffset.y) * sensor->magScale.y);
                         loc_mag.z = sensor->invertAxis.z * (((mz * 0.15f * adjZ) - sensor->magOffset.z) * sensor->magScale.z);
+                        magNewSample = true;
                     }
                 }
             }
@@ -631,7 +695,10 @@ void MPU9250::sensorTask(void *arg)
                 sensor->gyro = loc_gyro;
                 sensor->temperature = loc_temp;
 
-                if (sensor->magAvailable) {
+                // Only update the shared mag when this iteration produced a
+                // fresh sample; otherwise keep the last good value so the
+                // Mahony filter does not see a (0,0,0) field 9/10 of the time.
+                if (sensor->magAvailable && magNewSample) {
                     sensor->mag = loc_mag;
                 }
 
@@ -979,6 +1046,42 @@ MPU9250::Vector3 MPU9250::getMag()
         xSemaphoreGive(dataMutex);
     }
     return result;
+}
+
+MPU9250::Quaternion MPU9250::getQuaternion()
+{
+    // Returned in body-to-world convention. Always a unit quaternion as long
+    // as the Mahony path has run at least once since boot; otherwise it is
+    // the identity {1,0,0,0} initialised by the constructor.
+    Quaternion result{1.0f, 0.0f, 0.0f, 0.0f};
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+    {
+        result = q;
+        xSemaphoreGive(dataMutex);
+    }
+    return result;
+}
+
+esp_err_t MPU9250::setMahonyGains(float kp, float ki)
+{
+    if (kp < 0.0f || ki < 0.0f)
+    {
+        ESP_LOGE(TAG_MPU9250, "setMahonyGains: gains must be non-negative");
+        return ESP_ERR_INVALID_ARG;
+    }
+    // No mutex: these are written atomically on ESP32 (4-byte aligned float
+    // store) and read by the sensor task on the next iteration. Worst case
+    // is one extra iteration with mixed gains, which is harmless.
+    mahonyKp = kp;
+    mahonyKi = ki;
+    // Reset integral state when gains change to avoid a sudden kick from the
+    // accumulated error multiplied by the new Ki.
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+    {
+        mahonyIntegralError = {0.0f, 0.0f, 0.0f};
+        xSemaphoreGive(dataMutex);
+    }
+    return ESP_OK;
 }
 
 float MPU9250::getTemperature()

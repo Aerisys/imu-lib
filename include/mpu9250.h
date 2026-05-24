@@ -39,8 +39,14 @@ using std::min;
 #define GRAVITY 9.80665f
 #define CALIBRATION_SAMPLES 1000
 #define FILTER_ALPHA 0.96f // Complementary filter constant
-#define MAHONY_KP 0.5f     // Mahony filter proportional gain
-#define MAHONY_KI 0.1f     // Mahony filter integral gain
+// Default Mahony AHRS gains. These can be overridden at runtime through
+// setMahonyGains(). Ki is intentionally 0.0 by default: on a drone, a
+// non-zero Ki causes integral windup during aggressive maneuvers (rapid
+// roll/pitch, prolonged accel != 1g), which can latch a bias and tilt
+// the estimated attitude after the maneuver. Only enable Ki (typ. < 0.005)
+// if observed gyro bias drift in flight justifies it.
+#define MAHONY_KP 0.5f
+#define MAHONY_KI 0.0f
 
 // Debugging
 #define TAG_MPU9250 "MPU9250"
@@ -115,6 +121,19 @@ public:
     // It is used to represent accelerometer, gyroscope, and magnetometer readings.
     struct Vector3
     {
+        float x;
+        float y;
+        float z;
+    };
+
+    // Unit quaternion representing the body-to-world rotation. Returned by
+    // `getQuaternion()` and used internally by the Mahony AHRS filter.
+    // Convention: q = w + x*i + y*j + z*k, with w as the scalar component.
+    // Drone control loops should prefer this over Euler angles to avoid
+    // gimbal lock during inverted flight or pitch beyond +/- 90 deg.
+    struct Quaternion
+    {
+        float w;
         float x;
         float y;
         float z;
@@ -249,6 +268,26 @@ public:
     Vector3 getGyro();
     Vector3 getMag();
 
+    // Returns the latest unit quaternion produced by the Mahony filter
+    // (body-to-world rotation). Drone control loops should use this in
+    // preference to `getOrientation()`: it avoids gimbal lock at +/- 90 deg
+    // pitch (loops, flips, inverted flight) and is what a quaternion-based
+    // attitude controller consumes directly.
+    //
+    // If the COMPLEMENTARY filter is selected, the returned quaternion is
+    // the last one written by the Mahony path (not continuously updated);
+    // call setFilterMode(MAHONY) for a live quaternion.
+    Quaternion getQuaternion();
+
+    // Set the Mahony AHRS proportional / integral gains at runtime.
+    // Defaults are 0.5 (Kp) and 0.0 (Ki). Typical drone tuning ranges:
+    //   - Kp: 0.5 ... 2.0   (higher = more accel/mag trust, more noise)
+    //   - Ki: 0.0 ... 0.005 (small; non-zero only if gyro bias drift is
+    //                       observed in flight. Aggressive maneuvers can
+    //                       cause Ki integral windup, so keep it small.)
+    // Returns ESP_OK on success, ESP_ERR_INVALID_ARG on negative gains.
+    esp_err_t setMahonyGains(float kp, float ki);
+
     // The `getTemperature` method retrieves the current temperature reading from the sensor.
     // It returns the temperature in degrees Celsius.
     // The temperature is measured by the internal temperature sensor of the MPU9250.
@@ -359,8 +398,14 @@ private:
     // Filter mode
     FilterMode filterMode;
 
-    // Quaternion state for Mahony filter
-    struct Quaternion { float w, x, y, z; } q;
+    // Quaternion state for Mahony filter (body-to-world rotation).
+    // Type definition lives in the public section above.
+    Quaternion q;
+
+    // Mahony AHRS gains. Initialised to MAHONY_KP / MAHONY_KI defined at the
+    // top of this header; can be retuned at runtime via setMahonyGains().
+    float mahonyKp;
+    float mahonyKi;
 
     // Inverted axis
     struct InvertAxis
