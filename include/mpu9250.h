@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include <math.h>
 #include <string.h>
 #include <cfloat>
@@ -154,11 +155,25 @@ public:
     // - sclSpeedHz: SCL clock used for both the MPU and the AK8963 device handles.
     //               100 kHz (Standard Mode) by default. The MPU9250 supports up to
     //               400 kHz (Fast Mode); see the project README for performance notes.
+    // - intPin    : GPIO connected to the MPU9250 INT pin. When set, the sensor
+    //               task is woken by the DATA_READY interrupt instead of polling
+    //               at a fixed period, which dramatically reduces jitter and
+    //               lets the task track the actual sample rate (1 kHz with the
+    //               default DLPF settings). Set to GPIO_NUM_NC (-1) to keep the
+    //               legacy polling behaviour (~100 Hz) for boards where the INT
+    //               pin is not wired.
+    //               NOTE: to reach 1 kHz wakeup granularity reliably, the
+    //               application's FreeRTOS tick should be set to 1000 Hz
+    //               (CONFIG_FREERTOS_HZ=1000 in sdkconfig). With INT-driven
+    //               wakeups the tick rate only bounds the timeout fallback,
+    //               not the nominal loop, so a lower tick still works but the
+    //               watchdog/fallback resolution is coarser.
     struct Config
     {
-        uint8_t  mpuAddr    = 0x68;
-        uint8_t  magAddr    = 0x0C;
-        uint32_t sclSpeedHz = 100000;
+        uint8_t   mpuAddr    = 0x68;
+        uint8_t   magAddr    = 0x0C;
+        uint32_t  sclSpeedHz = 100000;
+        gpio_num_t intPin    = GPIO_NUM_NC;
     };
 
     // Constructor and Destructor
@@ -279,6 +294,12 @@ private:
 
     // Sensor Processing
     static void sensorTask(void *arg);
+
+    // Static ISR handler for the MPU9250 DATA_READY pin. Receives `this` via
+    // the GPIO ISR user-arg, then notifies the sensor task with
+    // vTaskNotifyGiveFromISR. Kept in IRAM so it is callable when the flash
+    // cache is disabled.
+    static void IRAM_ATTR dataReadyIsr(void *arg);
     void processMeasurements(float dt);
     void updateComplementaryFilter(float dt);
     void updateMahonyFilter(float dt);
@@ -296,6 +317,10 @@ private:
     i2c_master_bus_handle_t busHandle;
     i2c_master_dev_handle_t mpuDev;
     i2c_master_dev_handle_t magDev;
+
+    // GPIO pin wired to the MPU9250 INT (DATA_READY) line. GPIO_NUM_NC means
+    // the polling fallback is used in the sensor task.
+    gpio_num_t intPin;
 
     TaskHandle_t taskHandle;
     SemaphoreHandle_t dataMutex;

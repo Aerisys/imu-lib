@@ -10,6 +10,7 @@ MPU9250::MPU9250()
     : busHandle(nullptr),
       mpuDev(nullptr),
       magDev(nullptr),
+      intPin(GPIO_NUM_NC),
       taskHandle(nullptr),
       dataMutex(nullptr),
       accel{0, 0, 0},
@@ -37,6 +38,18 @@ MPU9250::MPU9250()
 
 MPU9250::~MPU9250()
 {
+    // Detach the GPIO ISR BEFORE deleting the task: otherwise an interrupt
+    // could fire and try to notify a freed task handle.
+    if (intPin != GPIO_NUM_NC)
+    {
+        gpio_isr_handler_remove(intPin);
+        // Best-effort: disable the DATA_READY interrupt source on the MPU
+        // itself so it stops driving the line after we're gone.
+        if (mpuDev != nullptr)
+            writeRegister(mpuDev, 0x38, 0x00); // INT_ENABLE = 0
+        intPin = GPIO_NUM_NC;
+    }
+
     if (taskHandle != nullptr)
     {
         vTaskDelete(taskHandle);
@@ -72,6 +85,7 @@ esp_err_t MPU9250::init(i2c_master_bus_handle_t bus, const Config& config)
     }
 
     busHandle = bus;
+    intPin = config.intPin;
 
     // Attach the MPU9250 itself as a device on the bus.
     i2c_device_config_t mpuCfg = {};
@@ -111,6 +125,16 @@ esp_err_t MPU9250::init(i2c_master_bus_handle_t bus, const Config& config)
         return err;
     }
     vTaskDelay(pdMS_TO_TICKS(10));
+
+    // Sample Rate Divider: Sample Rate = Internal_Sample_Rate / (1 + SMPLRT_DIV).
+    // With DLPF enabled (CONFIG below uses DLPF_CFG != 0 and != 7), Internal
+    // Sample Rate is fixed at 1 kHz, so writing 0 here makes the MPU produce
+    // one fresh accel+gyro sample every 1 ms. The DATA_READY interrupt then
+    // pulses at 1 kHz, which is the rate consumed by the sensor task when
+    // `Config::intPin` is wired.
+    err = writeRegister(mpuDev, 0x19, 0x00); // SMPLRT_DIV = 0 -> 1 kHz
+    if (err != ESP_OK)
+        return err;
 
     // Configure gyro and accel
     err = writeRegister(mpuDev, 0x1A, 0x03); // CONFIG: DLPF_CFG = 3
@@ -624,23 +648,64 @@ void MPU9250::sensorTask(void *arg)
         totalMathTime += (esp_timer_get_time() - startMath);
 
         loopCount++;
-        if (loopCount >= 100) // À 100Hz, ça fait 1 fois par seconde
+        // The profiler logs once per `kProfilerWindow` loops. With the
+        // INT-driven path running at 1 kHz this stays close to a 1-second
+        // cadence; with the polling fallback (~100 Hz) it logs every 5 s.
+        // Point 6 of the refactor plan will gate this block behind a build
+        // flag — for now it stays on to validate the rate change.
+        constexpr uint32_t kProfilerWindow = 500;
+        if (loopCount >= kProfilerWindow)
         {
-            ESP_LOGI("PROFILER", "--- Profiling sur 100 boucles ---");
-            ESP_LOGI("PROFILER", "I2C  (Moy)  : %lld us", totalI2cTime / 100);
+            ESP_LOGI("PROFILER", "--- Profiling sur %lu boucles ---", (unsigned long)kProfilerWindow);
+            ESP_LOGI("PROFILER", "I2C  (Moy)  : %lld us", totalI2cTime / kProfilerWindow);
             ESP_LOGI("PROFILER", "I2C  (Max)  : %lld us", maxI2cTime);
-            ESP_LOGI("PROFILER", "Math (Moy)  : %lld us", totalMathTime / 100);
-            ESP_LOGI("PROFILER", "Temps Libre : %lld us (sur 10000 us dispos par cycle)", 10000 - (totalI2cTime/100) - (totalMathTime/100));
-            
-            // Reset des compteurs
+            ESP_LOGI("PROFILER", "Math (Moy)  : %lld us", totalMathTime / kProfilerWindow);
+
             loopCount = 0;
             totalI2cTime = 0;
             totalMathTime = 0;
             maxI2cTime = 0;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10)); // 100 Hz
+        // -------------------------------------------------------------------
+        // Wait for the next sample.
+        //
+        // INT-driven mode (intPin set):
+        //   xTaskNotifyWait blocks until the GPIO ISR fires
+        //   vTaskNotifyGiveFromISR. A 20 ms timeout acts as a watchdog: if
+        //   the interrupt stops (cable yanked, sensor hung), the loop still
+        //   runs at 50 Hz minimum so health monitoring keeps working.
+        //
+        // Polling mode (intPin == GPIO_NUM_NC):
+        //   Legacy ~100 Hz behaviour, kept so the lib still works on boards
+        //   where the INT line is not wired.
+        // -------------------------------------------------------------------
+        if (sensor->intPin != GPIO_NUM_NC)
+        {
+            // ulTaskNotifyTake clears the notification count on exit so each
+            // ISR pulse corresponds to one loop iteration (no backlog).
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        }
+        else
+        {
+            vTaskDelay(pdMS_TO_TICKS(10)); // 100 Hz polling fallback
+        }
     }
+}
+
+void IRAM_ATTR MPU9250::dataReadyIsr(void *arg)
+{
+    // Wakes the sensor task on every MPU9250 sample. Kept extremely small
+    // (a single direct-to-task notification) to minimise ISR latency at
+    // 1 kHz. Any work — I2C reads, math — must happen in the task context.
+    MPU9250 *sensor = static_cast<MPU9250 *>(arg);
+    if (sensor->taskHandle == nullptr)
+        return;
+
+    BaseType_t higherWoken = pdFALSE;
+    vTaskNotifyGiveFromISR(sensor->taskHandle, &higherWoken);
+    if (higherWoken == pdTRUE)
+        portYIELD_FROM_ISR();
 }
 
 esp_err_t MPU9250::startSensorTask()
@@ -657,6 +722,60 @@ esp_err_t MPU9250::startSensorTask()
     {
         ESP_LOGE(TAG_MPU9250, "Failed to create sensor task");
         return ESP_FAIL;
+    }
+
+    // If the user provided an INT pin, wire it up to drive the sensor task.
+    // The order matters:
+    //   1. Task created first (so taskHandle is valid when the ISR fires).
+    //   2. GPIO + ISR installed.
+    //   3. MPU's INT_ENABLE bit set last, which is what actually starts
+    //      generating pulses on the pin.
+    if (intPin != GPIO_NUM_NC)
+    {
+        gpio_config_t io = {};
+        io.intr_type    = GPIO_INTR_POSEDGE;            // active-high pulse (INT_PIN_CFG ACTL=0)
+        io.pin_bit_mask = (1ULL << intPin);
+        io.mode         = GPIO_MODE_INPUT;
+        io.pull_down_en = GPIO_PULLDOWN_ENABLE;          // line idles low between pulses
+        io.pull_up_en   = GPIO_PULLUP_DISABLE;
+        esp_err_t err = gpio_config(&io);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG_MPU9250, "gpio_config(intPin=%d) failed: %d", intPin, err);
+            return err;
+        }
+
+        // The ISR service is per-app; ignore ESP_ERR_INVALID_STATE which
+        // simply means another component already installed it.
+        err = gpio_install_isr_service(0);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+        {
+            ESP_LOGE(TAG_MPU9250, "gpio_install_isr_service failed: %d", err);
+            return err;
+        }
+
+        err = gpio_isr_handler_add(intPin, &MPU9250::dataReadyIsr, this);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG_MPU9250, "gpio_isr_handler_add failed: %d", err);
+            return err;
+        }
+
+        // Enable RAW_DATA_RDY interrupt source on the MPU. After this write
+        // the INT pin will start pulsing at the sample rate (1 kHz with the
+        // SMPLRT_DIV/DLPF settings from init()).
+        err = writeRegister(mpuDev, 0x38, 0x01); // INT_ENABLE = RAW_DATA_RDY_EN
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG_MPU9250, "Failed to enable DATA_READY interrupt: %d", err);
+            return err;
+        }
+
+        ESP_LOGI(TAG_MPU9250, "DATA_READY interrupt enabled on GPIO %d", intPin);
+    }
+    else
+    {
+        ESP_LOGW(TAG_MPU9250, "No INT pin configured — falling back to polling (~100 Hz)");
     }
 
     return ESP_OK;
