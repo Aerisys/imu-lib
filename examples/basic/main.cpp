@@ -21,6 +21,11 @@
 extern "C" void app_main()
 {
     // 1. Create the I2C bus once for the whole application.
+    //
+    //    The bus itself has no clock — each device handle sets its own SCL
+    //    speed when added (see `MPU9250::Config::sclSpeedHz`, default 400 kHz).
+    //    On a real drone, prefer external 2.2 kOhm pull-ups on SDA/SCL over
+    //    the ESP32 internal ones for Fast Mode signal integrity.
     i2c_master_bus_config_t busCfg = {};
     busCfg.i2c_port           = I2C_NUM_0;
     busCfg.sda_io_num         = GPIO_NUM_21;

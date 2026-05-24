@@ -153,8 +153,12 @@ public:
     // - mpuAddr   : I2C address of the MPU9250 itself. 0x68 (AD0=GND) or 0x69 (AD0=VCC).
     // - magAddr   : I2C address of the AK8963 magnetometer. Fixed at 0x0C on MPU9250.
     // - sclSpeedHz: SCL clock used for both the MPU and the AK8963 device handles.
-    //               100 kHz (Standard Mode) by default. The MPU9250 supports up to
-    //               400 kHz (Fast Mode); see the project README for performance notes.
+    //               400 kHz (Fast Mode) by default — required to sustain the
+    //               1 kHz interrupt-driven loop. The MPU9250 and AK8963 are
+    //               both rated up to 400 kHz per their respective datasheets.
+    //               Lower it to 100 kHz (Standard Mode) only if running on a
+    //               shared bus with a slower peripheral or with long PCB
+    //               traces that would not meet Fast Mode rise/fall times.
     // - intPin    : GPIO connected to the MPU9250 INT pin. When set, the sensor
     //               task is woken by the DATA_READY interrupt instead of polling
     //               at a fixed period, which dramatically reduces jitter and
@@ -170,10 +174,10 @@ public:
     //               watchdog/fallback resolution is coarser.
     struct Config
     {
-        uint8_t   mpuAddr    = 0x68;
-        uint8_t   magAddr    = 0x0C;
-        uint32_t  sclSpeedHz = 100000;
-        gpio_num_t intPin    = GPIO_NUM_NC;
+        uint8_t    mpuAddr    = 0x68;
+        uint8_t    magAddr    = 0x0C;
+        uint32_t   sclSpeedHz = 400000;        // Fast Mode (see notes above)
+        gpio_num_t intPin     = GPIO_NUM_NC;
     };
 
     // Constructor and Destructor
