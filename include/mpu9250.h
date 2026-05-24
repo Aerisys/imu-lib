@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "imu_sensor.h"
 #include <math.h>
 #include <string.h>
 #include <cfloat>
@@ -103,68 +104,13 @@ using std::min;
 //     }
 // }
 // --------------------------------------------------------------------------------
-class MPU9250
+class MPU9250 : public IMUSensor
 {
 public:
-    // Sensor Data Structures
-    // These structures are used to represent the sensor data and orientation.
-
-    // The `Orientation` structure contains roll, pitch, and yaw angles in degrees.
-    struct Orientation
-    {
-        float roll;
-        float pitch;
-        float yaw;
-    };
-
-    // The `Vector3` structure represents a 3D vector with x, y, and z components.
-    // It is used to represent accelerometer, gyroscope, and magnetometer readings.
-    struct Vector3
-    {
-        float x;
-        float y;
-        float z;
-    };
-
-    // Unit quaternion representing the body-to-world rotation. Returned by
-    // `getQuaternion()` and used internally by the Mahony AHRS filter.
-    // Convention: q = w + x*i + y*j + z*k, with w as the scalar component.
-    // Drone control loops should prefer this over Euler angles to avoid
-    // gimbal lock during inverted flight or pitch beyond +/- 90 deg.
-    struct Quaternion
-    {
-        float w;
-        float x;
-        float y;
-        float z;
-    };
-
-    // The `CalibrationStatus` enum represents the calibration status of the sensor.
-    // It can be one of the following values:
-    // - NOT_CALIBRATED: The sensor is not calibrated.
-    // - CALIBRATING: The sensor is currently being calibrated.
-    // - CALIBRATED: The sensor has been calibrated successfully.
-    enum CalibrationStatus
-    {
-        NOT_CALIBRATED,
-        CALIBRATING,
-        CALIBRATED
-    };
-
-    // The `FilterMode` enum represents the filter mode used for orientation calculation.
-    // It can be one of the following values:
-    // - COMPLEMENTARY: Use the complementary filter for orientation estimation.
-    // - MAHONY: Use the Mahony filter for orientation estimation.
-    // The complementary filter combines accelerometer and gyroscope data to estimate orientation.
-    // The Mahony filter uses a quaternion-based approach to estimate orientation and includes an integral feedback loop.
-    // The choice of filter mode can affect the performance and accuracy of the orientation estimation.
-    // The complementary filter is simpler and faster, while the Mahony filter provides better performance in dynamic conditions.
-    // The filter mode can be set using the `setFilterMode` method.
-    enum FilterMode
-    {
-        COMPLEMENTARY,
-        MAHONY
-    };
+    // Value types (Vector3, Orientation, Quaternion) and enums
+    // (CalibrationStatus, FilterMode) are inherited from IMUSensor. Existing
+    // code referencing `MPU9250::Vector3`, `MPU9250::CALIBRATED`, etc. keeps
+    // working unchanged thanks to public inheritance scope rules.
 
     // The `Config` struct groups all the optional initialization parameters
     // for the sensor. It is passed to the `init` method.
@@ -236,14 +182,14 @@ public:
     // The calibration process is performed in the background and can take some time.
     // The method returns an ESP error code indicating the success or failure of the calibration.
     // The calibration status can be monitored using the `getCalibrationStatus` method.
-    esp_err_t calibrate();
+    esp_err_t calibrate() override;
 
     // The `setFilterMode` method sets the filter mode for orientation calculation.
     // It takes a `FilterMode` enum value as a parameter and sets the filter mode accordingly.
     // The filter mode can be set to either COMPLEMENTARY or MAHONY.
     // The choice of filter mode can affect the performance and accuracy of the orientation estimation.
     // The method returns an ESP error code indicating the success or failure of the operation.
-    esp_err_t setFilterMode(FilterMode mode);
+    esp_err_t setFilterMode(FilterMode mode) override;
 
     // The `startSensorTask` method starts the sensor task, which continuously reads sensor data
     // and processes it in the background. It returns an ESP error code indicating the success or failure.
@@ -251,22 +197,22 @@ public:
     // The task is responsible for reading sensor data, applying filters, and updating the orientation.
     // The task also handles calibration and health monitoring.
     // The task runs at a specified frequency, which can be adjusted in the implementation.
-    esp_err_t startSensorTask();
+    esp_err_t startSensorTask() override;
 
     // The `getOrientation` method retrieves the current orientation of the sensor.
     // It returns an `Orientation` structure containing the roll, pitch, and yaw angles in degrees.
     // The angles are computed using the complementary or Mahony filter, depending on the filter mode.
     // The roll angle represents the rotation around the x-axis, the pitch angle represents the rotation around the y-axis,
     // and the yaw angle represents the rotation around the z-axis.
-    Orientation getOrientation();
+    Orientation getOrientation() override;
 
     // The `getAccel`, `getGyro`, and `getMag` methods retrieve the current accelerometer, gyroscope, and magnetometer readings.
     // They return `Vector3` structures containing the x, y, and z components of the respective sensor data.
     // The accelerometer readings are in g (gravitational units), the gyroscope readings are in degrees per second,
     // and the magnetometer readings are in microteslas (µT).
-    Vector3 getAccel();
-    Vector3 getGyro();
-    Vector3 getMag();
+    Vector3 getAccel() override;
+    Vector3 getGyro() override;
+    Vector3 getMag() override;
 
     // Returns the latest unit quaternion produced by the Mahony filter
     // (body-to-world rotation). Drone control loops should use this in
@@ -277,7 +223,7 @@ public:
     // If the COMPLEMENTARY filter is selected, the returned quaternion is
     // the last one written by the Mahony path (not continuously updated);
     // call setFilterMode(MAHONY) for a live quaternion.
-    Quaternion getQuaternion();
+    Quaternion getQuaternion() override;
 
     // Set the Mahony AHRS proportional / integral gains at runtime.
     // Defaults are 0.5 (Kp) and 0.0 (Ki). Typical drone tuning ranges:
@@ -293,7 +239,7 @@ public:
     // The temperature is measured by the internal temperature sensor of the MPU9250.
     // The temperature reading can be used for compensation in some applications.
     // The temperature is not used for orientation calculation but can be useful for monitoring the sensor's operating conditions.
-    float getTemperature();
+    float getTemperature() override;
 
     // The `isSensorHealthy` method checks the health status of the sensor.
     // It returns true if the sensor is healthy and able to provide valid readings,
@@ -302,26 +248,26 @@ public:
     // The method can be used to detect sensor malfunctions or communication errors.
     // The health status can be used to trigger error handling or fallback mechanisms in the application.
     // The method can also be used to check if the sensor is ready for use after initialization or calibration.
-    bool isSensorHealthy();
+    bool isSensorHealthy() override;
 
     // The `getCalibrationStatus` method retrieves the current calibration status of the sensor.
     // It returns a `CalibrationStatus` enum value indicating whether the sensor is not calibrated,
     // currently being calibrated, or has been calibrated successfully.
-    CalibrationStatus getCalibrationStatus() { return calibStatus; }
+    CalibrationStatus getCalibrationStatus() override { return calibStatus; }
 
     // The `setInvertAxis` method sets the axis inversion for the sensor readings.
-    // It takes three boolean parameters indicating whether to invert the x, y, and z axes respectively.    
+    // It takes three boolean parameters indicating whether to invert the x, y, and z axes respectively.
     // Inverting an axis means that the readings from that axis will be negated.
     // This can be useful for correcting the orientation of the sensor in certain applications.
     // The method returns an ESP error code indicating the success or failure of the operation.
-    esp_err_t setInvertAxis(bool invertX, bool invertY, bool invertZ);
+    esp_err_t setInvertAxis(bool invertX, bool invertY, bool invertZ) override;
 
     // The `setSwitchRollPitch` method sets whether to switch the roll and pitch axes.
     // It takes a boolean parameter indicating whether to switch the axes.
     // Switching the roll and pitch axes means that the readings from these axes will be exchanged.
     // This can be useful for correcting the orientation of the sensor in certain applications.
     // The method returns an ESP error code indicating the success or failure of the operation.
-    esp_err_t setSwitchRollPitch(bool switchRollPitch);
+    esp_err_t setSwitchRollPitch(bool switchRollPitch) override;
 
     // -------------------------------------------------------------------------
     // Calibration persistence (NVS)

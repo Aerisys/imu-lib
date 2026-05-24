@@ -16,6 +16,7 @@
 // -----------------------------------------------------------------------------
 
 #include <mpu9250.h>
+#include "imu_sensor.h"
 #include "driver/i2c_master.h"
 #include "nvs_flash.h"
 
@@ -105,11 +106,16 @@ extern "C" void app_main()
         return;
     }
 
-    // 3. Consume the quaternion from the control loop. On a drone, prefer the
-    //    quaternion over Euler angles to avoid gimbal lock during loops/flips.
+    // 3. Consume the quaternion from the control loop. We deliberately go
+    //    through the abstract IMUSensor interface here to illustrate that
+    //    consumer code (PID, telemetry, etc.) does not need to know which
+    //    concrete chip is wired in. Swap the line below to a future ICM-*
+    //    implementation and the loop is unchanged.
+    IMUSensor* sensor = &imu;
+
     while (true)
     {
-        MPU9250::Quaternion q = imu.getQuaternion();
+        IMUSensor::Quaternion q = sensor->getQuaternion();
         ESP_LOGI("APP", "q = [w=%.3f x=%.3f y=%.3f z=%.3f]", q.w, q.x, q.y, q.z);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
