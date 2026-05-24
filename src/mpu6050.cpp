@@ -1,8 +1,11 @@
 #include "mpu6050.h"
 
+#define MPU6050_I2C_TIMEOUT_MS 100
+
 // Implementation
 MPU6050::MPU6050()
-    : i2cPort(I2C_NUM_0),
+    : busHandle(nullptr),
+      mpuDev(nullptr),
       taskHandle(nullptr),
       dataMutex(nullptr),
       lastProcessTime(0),
@@ -26,25 +29,41 @@ MPU6050::MPU6050()
 MPU6050::~MPU6050()
 {
     if (taskHandle)
+    {
         vTaskDelete(taskHandle);
+        taskHandle = nullptr;
+    }
+    // Release the device handle but NOT the bus (owned by the caller).
+    if (mpuDev)
+    {
+        i2c_master_bus_rm_device(mpuDev);
+        mpuDev = nullptr;
+    }
     if (dataMutex)
+    {
         vSemaphoreDelete(dataMutex);
+        dataMutex = nullptr;
+    }
 }
 
-esp_err_t MPU6050::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
+esp_err_t MPU6050::init(i2c_master_bus_handle_t bus, const Config& config)
 {
-    i2cPort = port;
-    // I2C configuration
-    i2c_config_t conf = {};
-    conf.mode = I2C_MODE_MASTER;
-    conf.sda_io_num = sdaPin;
-    conf.scl_io_num = sclPin;
-    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.master.clk_speed = 100000;
+    if (bus == nullptr)
+    {
+        ESP_LOGE(TAG_MPU6050, "init: bus handle is null");
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    ESP_RETURN_ON_ERROR(i2c_param_config(i2cPort, &conf), TAG_MPU6050, "I2C config failed");
-    ESP_RETURN_ON_ERROR(i2c_driver_install(i2cPort, conf.mode, 0, 0, 0), TAG_MPU6050, "I2C driver install failed");
+    busHandle = bus;
+
+    // Attach this MPU6050 as a device on the externally-owned bus.
+    i2c_device_config_t devCfg = {};
+    devCfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    devCfg.device_address  = config.mpuAddr;
+    devCfg.scl_speed_hz    = config.sclSpeedHz;
+
+    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(busHandle, &devCfg, &mpuDev),
+                        TAG_MPU6050, "Failed to add MPU6050 device");
 
     // Check device ID
     uint8_t whoami = 0;
@@ -92,14 +111,11 @@ esp_err_t MPU6050::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
 
 esp_err_t MPU6050::writeRegister(uint8_t reg, uint8_t data)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_write_byte(cmd, data, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(i2cPort, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
+    if (mpuDev == nullptr)
+        return ESP_ERR_INVALID_STATE;
+
+    const uint8_t buffer[2] = {reg, data};
+    esp_err_t ret = i2c_master_transmit(mpuDev, buffer, sizeof(buffer), MPU6050_I2C_TIMEOUT_MS);
     if (ret == ESP_OK)
         successCount++;
     else
@@ -109,18 +125,11 @@ esp_err_t MPU6050::writeRegister(uint8_t reg, uint8_t data)
 
 esp_err_t MPU6050::readRegisters(uint8_t reg, uint8_t length, uint8_t *data)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_READ, true);
-    if (length > 1)
-        i2c_master_read(cmd, data, length - 1, I2C_MASTER_ACK);
-    i2c_master_read_byte(cmd, data + length - 1, I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(i2cPort, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
+    if (mpuDev == nullptr || data == nullptr || length == 0)
+        return ESP_ERR_INVALID_ARG;
+
+    // Repeated-start in a single transaction (required by MPU register map).
+    esp_err_t ret = i2c_master_transmit_receive(mpuDev, &reg, 1, data, length, MPU6050_I2C_TIMEOUT_MS);
     if (ret == ESP_OK)
         successCount++;
     else
@@ -294,12 +303,14 @@ void MPU6050::updateMahonyQuat(float dt)
 
 void MPU6050::processMeasurements(float dt)
 {
+    // The MAHONY_QUAT public enum value was removed when MPU6050 was made an
+    // IMUSensor implementation (the interface only exposes COMPLEMENTARY and
+    // MAHONY). `updateMahonyQuat` remains in the file for now — call it from
+    // here if you decide it should be the default Mahony backend.
     if (filterMode == COMPLEMENTARY)
         updateComplementaryFilter(dt);
     else if (filterMode == MAHONY)
         updateMahonyFilter(dt);
-    else if (filterMode == MAHONY_QUAT)
-        updateMahonyQuat(dt);
     else
         ESP_LOGE(TAG_MPU6050, "Unknown filter mode");
 }
@@ -501,5 +512,27 @@ void MPU6050::performCalibration()
     // Log calibration results
     ESP_LOGI(TAG_MPU6050, "Accel offsets: %.3f, %.3f, %.3f", accelOffset.x, accelOffset.y, accelOffset.z);
     ESP_LOGI(TAG_MPU6050, "Gyro offsets: %.3f, %.3f, %.3f", gyroOffset.x, gyroOffset.y, gyroOffset.z);
+}
+
+// -----------------------------------------------------------------------------
+// IMUSensor interface stubs
+// -----------------------------------------------------------------------------
+// Provided so MPU6050 is a valid concrete implementation of the polymorphic
+// IMUSensor API. The MPU6050 sample pipeline does not yet apply axis-inversion
+// or roll/pitch swap (those features were originally MPU9250-only). The stubs
+// return ESP_OK so consumer code that calls them through IMUSensor* does not
+// fail; implement them properly in this file if the project starts shipping
+// boards where the MPU6050 mounting orientation requires correction.
+
+esp_err_t MPU6050::setInvertAxis(bool /*invertX*/, bool /*invertY*/, bool /*invertZ*/)
+{
+    ESP_LOGW(TAG_MPU6050, "setInvertAxis: not implemented on MPU6050 (accepted, no-op)");
+    return ESP_OK;
+}
+
+esp_err_t MPU6050::setSwitchRollPitch(bool /*swap*/)
+{
+    ESP_LOGW(TAG_MPU6050, "setSwitchRollPitch: not implemented on MPU6050 (accepted, no-op)");
+    return ESP_OK;
 }
 

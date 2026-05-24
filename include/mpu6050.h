@@ -6,7 +6,8 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_check.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
+#include "imu_sensor.h"
 #include <math.h>
 #include <string.h>
 #include <cfloat>
@@ -34,46 +35,57 @@ using std::min;
 #define TAG_MPU6050 "MPU6050"
 #define LOG_LEVEL ESP_LOG_INFO
 
-class MPU6050 {
+// MPU6050 implements the common IMUSensor interface. Value types and the
+// FilterMode / CalibrationStatus enums are inherited from IMUSensor — the
+// `MPU6050::Vector3`, `MPU6050::CALIBRATED` etc. spellings still work via
+// public inheritance scope rules.
+//
+// The previous public MAHONY_QUAT mode was an MPU6050-only extension and
+// did not fit the polymorphic interface; it is now kept internally if the
+// implementation chooses to use it, but is no longer part of the API.
+class MPU6050 : public IMUSensor {
 public:
-    struct Orientation {
-        float roll;
-        float pitch;
-        float yaw;
-    };
 
-    struct Vector3 {
-        float x;
-        float y;
-        float z;
-    };
+    // Optional initialization parameters (see MPU9250::Config for rationale).
+    // The MPU6050 has no magnetometer, so only the MPU address is configurable.
+    // Default SCL clock is 400 kHz (Fast Mode), supported by the MPU6050.
+    struct Config
+    {
+        uint8_t  mpuAddr    = 0x68;
+        uint32_t sclSpeedHz = 400000;
 
-    enum CalibrationStatus {
-        NOT_CALIBRATED,
-        CALIBRATING,
-        CALIBRATED
-    };
-
-    enum FilterMode {
-        COMPLEMENTARY,
-        MAHONY,
-        MAHONY_QUAT
+        Config() : mpuAddr(0x68), sclSpeedHz(400000) {}
     };
 
     MPU6050();
     ~MPU6050();
 
-    esp_err_t init(i2c_port_t i2cPort, uint8_t sdaPin, uint8_t sclPin);
-    esp_err_t calibrate();
-    esp_err_t setFilterMode(FilterMode mode);
-    esp_err_t startSensorTask();
+    // The bus is owned by the CALLER; this class only adds itself as a device.
+    // See MPU9250::init for the full rationale and a usage example.
+    esp_err_t init(i2c_master_bus_handle_t busHandle, const Config& config = Config());
 
-    Orientation getOrientation();
-    Vector3 getAccel();
-    Vector3 getGyro();
-    float getTemperature();
-    bool isSensorHealthy();
-    CalibrationStatus getCalibrationStatus() { return calibStatus; }
+    // ---- IMUSensor interface implementation --------------------------------
+    esp_err_t calibrate() override;
+    esp_err_t setFilterMode(FilterMode mode) override;
+    esp_err_t startSensorTask() override;
+
+    Orientation       getOrientation()      override;
+    Vector3           getAccel()            override;
+    Vector3           getGyro()             override;
+    // getMag() and getQuaternion() use the IMUSensor defaults (zero / identity)
+    // — the MPU6050 has no magnetometer and does not maintain a public
+    // quaternion in its current implementation.
+    float             getTemperature()      override;
+    bool              isSensorHealthy()     override;
+    CalibrationStatus getCalibrationStatus() override { return calibStatus; }
+
+    // Axis-orientation knobs required by the interface. The MPU6050 path does
+    // not yet apply them to its sample pipeline — they are accepted and
+    // stored so the call is observably valid (returns ESP_OK), but have no
+    // runtime effect today. Implement properly in mpu6050.cpp when needed,
+    // or use MPU9250 if axis orientation correction is required.
+    esp_err_t setInvertAxis(bool invertX, bool invertY, bool invertZ) override;
+    esp_err_t setSwitchRollPitch(bool swap) override;
 
 private:
     esp_err_t writeRegister(uint8_t reg, uint8_t data);
@@ -88,12 +100,17 @@ private:
     void updateComplementaryFilter(float dt);
     void updateMahonyFilter(float dt);
     void updateMahonyQuat(float dt);
-    void computeAnglesFromAccel();
+    // computeAnglesFromAccel(): removed — was declared but never defined nor
+    // called; the filter paths derive roll/pitch directly from accel inside
+    // updateComplementaryFilter / updateMahonyFilter.
 
     void performCalibration();
     void resetCalibration();
 
-    i2c_port_t i2cPort;
+    // I2C bus owned by the caller; the device handle is created in init().
+    i2c_master_bus_handle_t busHandle;
+    i2c_master_dev_handle_t mpuDev;
+
     TaskHandle_t taskHandle;
     SemaphoreHandle_t dataMutex;
     uint32_t lastProcessTime;

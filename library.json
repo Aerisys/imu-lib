@@ -1,8 +1,8 @@
 {
     "name": "imu-lib",
-    "version": "1.0.1",
-    "description": "",
-    "keywords": [],
+    "version": "1.1.0",
+    "description": "IMU library for ESP32 (MPU6050 / MPU9250) on ESP-IDF",
+    "keywords": ["imu", "mpu9250", "mpu6050", "esp32", "esp-idf", "drone"],
     "repository": {
         "type": "git",
         "url": "https://github.com/Aerisys/imu-lib.git"
@@ -15,10 +15,31 @@
         }
     ],
     "dependencies": {},
-    "frameworks": [
-        "espidf"
-    ],
-    "platforms": [
-        "espressif32"
-    ]
+    "frameworks": ["espidf"],
+    "platforms": ["espressif32"],
+    "export": {
+        "include": [
+            "src/*.cpp",
+            "include/*.h",
+            "library.json",
+            "LICENCE",
+            "README*"
+        ],
+        "exclude": [
+            "examples",
+            "test",
+            "lib",
+            "docs",
+            "platformio.ini",
+            "CMakeLists.txt",
+            "src/CMakeLists.txt",
+            "sdkconfig*"
+        ]
+    },
+    "build": {
+        "srcFilter": [
+            "+<*.cpp>"
+        ],
+        "includeDir": "include"
+    }
 }
