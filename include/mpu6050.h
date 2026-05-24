@@ -53,6 +53,8 @@ public:
     {
         uint8_t  mpuAddr    = 0x68;
         uint32_t sclSpeedHz = 400000;
+
+        Config() : mpuAddr(0x68), sclSpeedHz(400000) {}
     };
 
     MPU6050();
@@ -60,7 +62,7 @@ public:
 
     // The bus is owned by the CALLER; this class only adds itself as a device.
     // See MPU9250::init for the full rationale and a usage example.
-    esp_err_t init(i2c_master_bus_handle_t busHandle, const Config& config = {});
+    esp_err_t init(i2c_master_bus_handle_t busHandle, const Config& config = Config());
 
     // ---- IMUSensor interface implementation --------------------------------
     esp_err_t calibrate() override;

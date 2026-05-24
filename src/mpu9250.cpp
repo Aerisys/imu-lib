@@ -59,6 +59,11 @@ MPU9250::MPU9250()
       intPin(GPIO_NUM_NC),
       taskHandle(nullptr),
       dataMutex(nullptr),
+      sampleSem(nullptr),
+      publishedBundle{},
+      bundleSeq(0),
+      gyroNotchCoeffs{1.0f, 0.0f, 0.0f, 0.0f, 0.0f}, // passthrough
+      gyroNotchEnabled(false),
       accel{0, 0, 0},
       gyro{0, 0, 0},
       mag{0, 0, 0},
@@ -81,14 +86,7 @@ MPU9250::MPU9250()
       q{1.0f, 0.0f, 0.0f, 0.0f}, // Identity quaternion (no rotation)
       mahonyKp(MAHONY_KP),
       mahonyKi(MAHONY_KI),
-      // Explicit default for switchRollPitch: previously left uninitialised,
-      // which read as garbage on the first processMeasurements() call before
-      // setSwitchRollPitch() was invoked by the user.
-      switchRollPitch(false),
-      publishedBundle{},
-      bundleSeq(0),
-      gyroNotchCoeffs{1.0f, 0.0f, 0.0f, 0.0f, 0.0f}, // passthrough
-      gyroNotchEnabled(false)
+      switchRollPitch(false)
 {
     memset(magAdjustValues, 0, sizeof(magAdjustValues));
     memset(gyroNotchState, 0, sizeof(gyroNotchState));
@@ -225,9 +223,23 @@ esp_err_t MPU9250::init(i2c_master_bus_handle_t bus, const Config& config)
     if (err != ESP_OK)
         return err;
 
-    // Configure interrupt pin: BYPASS_EN=1 so the AK8963 is reachable as a
-    // separate device on the same I2C bus (not through the MPU's I2C master).
-    err = writeRegister(mpuDev, MPU9250_INT_PIN_CFG, 0x22);
+    // Configure interrupt pin (INT_PIN_CFG register, datasheet table 21):
+    //   bit 7 ACTL              = 0  -> active-high
+    //   bit 6 OPEN              = 0  -> push-pull
+    //   bit 5 LATCH_INT_EN      = 0  -> 50 us pulse (NOT latched). With
+    //                                   LATCH=1, the INT line stayed high
+    //                                   forever after the first sample
+    //                                   unless we read INT_STATUS (0x3A),
+    //                                   so the GPIO POSEDGE ISR fired
+    //                                   exactly once and the sensor task
+    //                                   fell back to the 20 ms timeout.
+    //   bit 4 INT_ANYRD_2CLEAR  = 1  -> interrupt is cleared by any read,
+    //                                   which our 14-byte burst already
+    //                                   does on every iteration.
+    //   bit 1 BYPASS_EN         = 1  -> AK8963 reachable as a separate
+    //                                   device on the same I2C bus.
+    //   => 0b0001 0010 = 0x12
+    err = writeRegister(mpuDev, MPU9250_INT_PIN_CFG, 0x12);
     if (err != ESP_OK)
         return err;
 
@@ -638,6 +650,23 @@ void MPU9250::sensorTask(void *arg)
     MPU9250 *sensor = static_cast<MPU9250 *>(arg);
     int64_t lastTime = esp_timer_get_time();
 
+    // Magnetometer poll throttle.
+    //
+    // The AK8963 runs at 100 Hz internally (continuous mode 2 configured in
+    // init()), i.e. one fresh sample every 10 ms. Polling its DRDY bit at
+    // 1 kHz wastes ~390 us of I2C per iteration on stale data, which pushes
+    // the per-loop budget above the 1 ms sample period and forces the task
+    // down to ~870 Hz effective.
+    //
+    // We instead attempt one full mag read every 9 ms (slightly faster than
+    // the producer so we never miss a sample). At 1 kHz iteration rate this
+    // is ~1 attempt every 9 iterations; at the 100 Hz polling fallback,
+    // it's roughly every iteration — both behave correctly without changes.
+    //
+    // Storing as a function-local (not a class member) so multiple MPU9250
+    // instances each get their own counter, and we avoid any shared state.
+    int64_t nextMagReadUs = 0; // 0 ensures the first iteration reads
+
 #if MPU9250_PROFILER
     // Per-loop timing accumulators. Compiled out by default; enable via
     // -DMPU9250_PROFILER=1 in the consumer build flags when investigating
@@ -744,9 +773,17 @@ void MPU9250::sensorTask(void *arg)
             newDataReady = true;
         }
 
-        // Magnetometer
-        if (sensor->magAvailable)
+        // Magnetometer — throttled to ~111 Hz to match the AK8963 internal
+        // sample rate (100 Hz). Without this throttle we burned ~390 us of
+        // I2C every iteration polling for stale data, blowing the 1 ms
+        // budget needed to sustain the 1 kHz INT-driven loop. See the
+        // declaration of `nextMagReadUs` above the loop for the rationale.
+        if (sensor->magAvailable && now >= nextMagReadUs)
         {
+            // Schedule the next attempt before doing the I2C so a one-off
+            // bus error doesn't cause back-to-back retries on the next iter.
+            nextMagReadUs = now + 9000;
+
             uint8_t st1;
             // If data ready
             if (sensor->readRegisters(sensor->magDev, 0x02, 1, &st1) == ESP_OK && (st1 & 0x01))
@@ -756,7 +793,7 @@ void MPU9250::sensorTask(void *arg)
                 if (sensor->readRegisters(sensor->magDev, 0x03, 7, magBuf) == ESP_OK)
                 {
                     // Check overflow mag
-                    if (!(magBuf[6] & 0x08)) 
+                    if (!(magBuf[6] & 0x08))
                     {
                         int16_t mx = (magBuf[1] << 8) | magBuf[0];
                         int16_t my = (magBuf[3] << 8) | magBuf[2];
@@ -1483,6 +1520,7 @@ MPU9250::SampleBundle MPU9250::getSnapshot()
         {
             // Writer in progress — yield and retry.
             taskYIELD();
+            s2 = s1 - 1; // FIX: Initialize s2 to force a mismatch and retry
             continue;
         }
         local = publishedBundle;

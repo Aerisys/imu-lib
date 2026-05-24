@@ -145,6 +145,8 @@ public:
         uint8_t    magAddr    = 0x0C;
         uint32_t   sclSpeedHz = 400000;        // Fast Mode (see notes above)
         gpio_num_t intPin     = GPIO_NUM_NC;
+
+        Config() : mpuAddr(0x68), magAddr(0x0C), sclSpeedHz(400000), intPin(GPIO_NUM_NC) {}
     };
 
     // Constructor and Destructor
@@ -177,7 +179,7 @@ public:
     //
     // The destructor removes only the MPU/AK8963 device handles from the bus;
     // the bus itself remains owned by the caller.
-    esp_err_t init(i2c_master_bus_handle_t busHandle, const Config& config = {});
+    esp_err_t init(i2c_master_bus_handle_t busHandle, const Config& config = Config());
 
     // -------------------------------------------------------------------------
     // calibrate() — fulfils the IMUSensor interface contract by performing
