@@ -303,12 +303,14 @@ void MPU6050::updateMahonyQuat(float dt)
 
 void MPU6050::processMeasurements(float dt)
 {
+    // The MAHONY_QUAT public enum value was removed when MPU6050 was made an
+    // IMUSensor implementation (the interface only exposes COMPLEMENTARY and
+    // MAHONY). `updateMahonyQuat` remains in the file for now — call it from
+    // here if you decide it should be the default Mahony backend.
     if (filterMode == COMPLEMENTARY)
         updateComplementaryFilter(dt);
     else if (filterMode == MAHONY)
         updateMahonyFilter(dt);
-    else if (filterMode == MAHONY_QUAT)
-        updateMahonyQuat(dt);
     else
         ESP_LOGE(TAG_MPU6050, "Unknown filter mode");
 }
@@ -510,5 +512,27 @@ void MPU6050::performCalibration()
     // Log calibration results
     ESP_LOGI(TAG_MPU6050, "Accel offsets: %.3f, %.3f, %.3f", accelOffset.x, accelOffset.y, accelOffset.z);
     ESP_LOGI(TAG_MPU6050, "Gyro offsets: %.3f, %.3f, %.3f", gyroOffset.x, gyroOffset.y, gyroOffset.z);
+}
+
+// -----------------------------------------------------------------------------
+// IMUSensor interface stubs
+// -----------------------------------------------------------------------------
+// Provided so MPU6050 is a valid concrete implementation of the polymorphic
+// IMUSensor API. The MPU6050 sample pipeline does not yet apply axis-inversion
+// or roll/pitch swap (those features were originally MPU9250-only). The stubs
+// return ESP_OK so consumer code that calls them through IMUSensor* does not
+// fail; implement them properly in this file if the project starts shipping
+// boards where the MPU6050 mounting orientation requires correction.
+
+esp_err_t MPU6050::setInvertAxis(bool /*invertX*/, bool /*invertY*/, bool /*invertZ*/)
+{
+    ESP_LOGW(TAG_MPU6050, "setInvertAxis: not implemented on MPU6050 (accepted, no-op)");
+    return ESP_OK;
+}
+
+esp_err_t MPU6050::setSwitchRollPitch(bool /*swap*/)
+{
+    ESP_LOGW(TAG_MPU6050, "setSwitchRollPitch: not implemented on MPU6050 (accepted, no-op)");
+    return ESP_OK;
 }
 
