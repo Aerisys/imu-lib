@@ -29,6 +29,7 @@
             "examples",
             "test",
             "lib",
+            "docs",
             "platformio.ini",
             "CMakeLists.txt",
             "src/CMakeLists.txt",
