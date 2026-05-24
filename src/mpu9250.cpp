@@ -1,9 +1,15 @@
 #include "mpu9250.h"
-#define I2C_MASTER_NUM I2C_NUM_0
+
+// I2C transaction timeout in ms used for register reads/writes.
+// Generous enough for clock stretching on slow buses; tight enough that
+// the sensor task does not hang on a wire fault.
+#define MPU9250_I2C_TIMEOUT_MS 100
 
 // Implementation
 MPU9250::MPU9250()
-    : i2cPort(I2C_NUM_0),
+    : busHandle(nullptr),
+      mpuDev(nullptr),
+      magDev(nullptr),
       taskHandle(nullptr),
       dataMutex(nullptr),
       accel{0, 0, 0},
@@ -34,58 +40,63 @@ MPU9250::~MPU9250()
     if (taskHandle != nullptr)
     {
         vTaskDelete(taskHandle);
+        taskHandle = nullptr;
+    }
+
+    // Remove device handles from the bus. We do NOT delete the bus itself:
+    // it is owned by the caller and may have other devices attached.
+    if (mpuDev != nullptr)
+    {
+        i2c_master_bus_rm_device(mpuDev);
+        mpuDev = nullptr;
+    }
+    if (magDev != nullptr)
+    {
+        i2c_master_bus_rm_device(magDev);
+        magDev = nullptr;
     }
 
     if (dataMutex != nullptr)
     {
         vSemaphoreDelete(dataMutex);
+        dataMutex = nullptr;
     }
 }
 
-esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
+esp_err_t MPU9250::init(i2c_master_bus_handle_t bus, const Config& config)
 {
-    i2cPort = port;
-
-    // Configure I2C
-    i2c_config_t conf;
-    esp_err_t err;
-    conf.mode = I2C_MODE_MASTER;
-    conf.sda_io_num = sdaPin;
-    conf.scl_io_num = sclPin;
-    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.master.clk_speed = 100000;
-    conf.clk_flags = 0;
-
-    
-    err = i2c_param_config(i2cPort, &conf);
-    if (err != ESP_OK)
+    if (bus == nullptr)
     {
-        ESP_LOGE(TAG_MPU9250, "I2C config failed");
-        return err;
+        ESP_LOGE(TAG_MPU9250, "init: bus handle is null");
+        return ESP_ERR_INVALID_ARG;
     }
 
+    busHandle = bus;
 
-    //Initialize I2C driver
-    err = i2c_driver_install(i2cPort, conf.mode, 0, 0, 0);
+    // Attach the MPU9250 itself as a device on the bus.
+    i2c_device_config_t mpuCfg = {};
+    mpuCfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    mpuCfg.device_address  = config.mpuAddr;
+    mpuCfg.scl_speed_hz    = config.sclSpeedHz;
+
+    esp_err_t err = i2c_master_bus_add_device(busHandle, &mpuCfg, &mpuDev);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG_MPU9250, "I2C driver install failed");
+        ESP_LOGE(TAG_MPU9250, "Failed to add MPU device (0x%02x): %d", config.mpuAddr, err);
         return err;
     }
 
     // Check MPU9250 identity
     uint8_t whoami = 0;
-    err = readRegisters(MPU9250_ADDR, MPU9250_WHO_AM_I, 1, &whoami);
+    err = readRegisters(mpuDev, MPU9250_WHO_AM_I, 1, &whoami);
     if (err != ESP_OK || whoami != 0x71)
     {
-        ESP_LOGE(TAG_MPU9250, "MPU9250 not found, WHO_AM_I = 0x%02x", whoami);
-        ESP_LOGE(TAG_MPU9250, "error: %d", err);
+        ESP_LOGE(TAG_MPU9250, "MPU9250 not found, WHO_AM_I = 0x%02x (err=%d)", whoami, err);
         return ESP_FAIL;
     }
 
     // Reset device
-    err = writeRegister(MPU9250_ADDR, MPU9250_PWR_MGMT_1, 0x80);
+    err = writeRegister(mpuDev, MPU9250_PWR_MGMT_1, 0x80);
     if (err != ESP_OK) {
         ESP_LOGE(TAG_MPU9250, "Failed to reset MPU9250");
         return err;
@@ -94,7 +105,7 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Wake up device
-    err = writeRegister(MPU9250_ADDR, MPU9250_PWR_MGMT_1, 0x01);
+    err = writeRegister(mpuDev, MPU9250_PWR_MGMT_1, 0x01);
     if (err != ESP_OK){
         ESP_LOGE(TAG_MPU9250, "Failed to wake up MPU9250");
         return err;
@@ -102,85 +113,99 @@ esp_err_t MPU9250::init(i2c_port_t port, uint8_t sdaPin, uint8_t sclPin)
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // Configure gyro and accel
-    err = writeRegister(MPU9250_ADDR, 0x1A, 0x03); // CONFIG: DLPF_CFG = 3
+    err = writeRegister(mpuDev, 0x1A, 0x03); // CONFIG: DLPF_CFG = 3
     if (err != ESP_OK)
         return err;
 
-    err = writeRegister(MPU9250_ADDR, 0x1B, 0x10); // GYRO_CONFIG: ±1000 dps
+    err = writeRegister(mpuDev, 0x1B, 0x10); // GYRO_CONFIG: ±1000 dps
     if (err != ESP_OK)
         return err;
 
-    err = writeRegister(MPU9250_ADDR, 0x1C, 0x08); // ACCEL_CONFIG: ±4g
+    err = writeRegister(mpuDev, 0x1C, 0x08); // ACCEL_CONFIG: ±4g
     if (err != ESP_OK)
         return err;
 
-    err = writeRegister(MPU9250_ADDR, 0x1D, 0x03); // ACCEL_CONFIG2: DLPF_CFG = 3
+    err = writeRegister(mpuDev, 0x1D, 0x03); // ACCEL_CONFIG2: DLPF_CFG = 3
     if (err != ESP_OK)
         return err;
 
-    // Configure interrupt pin
-    err = writeRegister(MPU9250_ADDR, MPU9250_INT_PIN_CFG, 0x22); // INT_PIN_CFG: BYPASS_EN=1, LATCH_INT_EN=0
+    // Configure interrupt pin: BYPASS_EN=1 so the AK8963 is reachable as a
+    // separate device on the same I2C bus (not through the MPU's I2C master).
+    err = writeRegister(mpuDev, MPU9250_INT_PIN_CFG, 0x22);
     if (err != ESP_OK)
         return err;
 
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Check magnetometer
+    // Attach the AK8963 magnetometer as a second device on the same bus.
+    // Once attached, presence is verified via WHO_AM_I; if missing, the
+    // handle is released and the rest of the lib works without magnetometer.
+    i2c_device_config_t magCfg = {};
+    magCfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    magCfg.device_address  = config.magAddr;
+    magCfg.scl_speed_hz    = config.sclSpeedHz;
+
+    err = i2c_master_bus_add_device(busHandle, &magCfg, &magDev);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG_MPU9250, "Failed to add AK8963 device (0x%02x): %d — continuing without mag", config.magAddr, err);
+        magDev = nullptr;
+        magAvailable = false;
+        return ESP_OK;
+    }
+
     uint8_t magWhoami = 0;
-    err = readRegisters(AK8963_ADDR, AK8963_WHO_AM_I, 1, &magWhoami);
+    err = readRegisters(magDev, AK8963_WHO_AM_I, 1, &magWhoami);
     if (err == ESP_OK && magWhoami == 0x48)
     {
         ESP_LOGI(TAG_MPU9250, "AK8963 magnetometer found");
         magAvailable = true;
 
         // Reset AK8963
-        err = writeRegister(AK8963_ADDR, AK8963_CNTL1, 0x00); // Power down
+        err = writeRegister(magDev, AK8963_CNTL1, 0x00); // Power down
         if (err != ESP_OK)
             return err;
         vTaskDelay(pdMS_TO_TICKS(10));
 
         // Read adjustment values
-        err = writeRegister(AK8963_ADDR, AK8963_CNTL1, 0x0F); // Fuse ROM access mode
+        err = writeRegister(magDev, AK8963_CNTL1, 0x0F); // Fuse ROM access mode
         if (err != ESP_OK)
             return err;
         vTaskDelay(pdMS_TO_TICKS(10));
 
-        err = readRegisters(AK8963_ADDR, AK8963_ASAX, 3, magAdjustValues);
+        err = readRegisters(magDev, AK8963_ASAX, 3, magAdjustValues);
         if (err != ESP_OK)
             return err;
 
         // Set to continuous mode 2 (100Hz)
-        err = writeRegister(AK8963_ADDR, AK8963_CNTL1, 0x16);
+        err = writeRegister(magDev, AK8963_CNTL1, 0x16);
         if (err != ESP_OK)
             return err;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     else
     {
-        ESP_LOGW(TAG_MPU9250, "AK8963 magnetometer not found");
+        ESP_LOGW(TAG_MPU9250, "AK8963 magnetometer not found (whoami=0x%02x)", magWhoami);
         magAvailable = false;
+        i2c_master_bus_rm_device(magDev);
+        magDev = nullptr;
     }
 
     return ESP_OK;
 }
 
-esp_err_t MPU9250::writeRegister(uint8_t addr, uint8_t reg, uint8_t data)
+esp_err_t MPU9250::writeRegister(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t data)
 {
-    uint8_t buffer[2] = {reg, data};
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    if (dev == nullptr)
+        return ESP_ERR_INVALID_STATE;
 
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write(cmd, buffer, 2, true);
-    i2c_master_stop(cmd);
-
-    esp_err_t ret = i2c_master_cmd_begin(i2cPort, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
+    const uint8_t buffer[2] = {reg, data};
+    esp_err_t ret = i2c_master_transmit(dev, buffer, sizeof(buffer), MPU9250_I2C_TIMEOUT_MS);
 
     if (ret != ESP_OK)
     {
         errorCount++;
-        ESP_LOGD(TAG_MPU9250, "Write register failed: device=0x%02x, reg=0x%02x, err=%d", addr, reg, ret);
+        ESP_LOGD(TAG_MPU9250, "Write register failed: reg=0x%02x, err=%d", reg, ret);
     }
     else
     {
@@ -190,30 +215,19 @@ esp_err_t MPU9250::writeRegister(uint8_t addr, uint8_t reg, uint8_t data)
     return ret;
 }
 
-esp_err_t MPU9250::readRegisters(uint8_t addr, uint8_t reg, uint8_t length, uint8_t *data)
+esp_err_t MPU9250::readRegisters(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t length, uint8_t *data)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    if (dev == nullptr || data == nullptr || length == 0)
+        return ESP_ERR_INVALID_ARG;
 
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_READ, true);
-
-    if (length > 1)
-    {
-        i2c_master_read(cmd, data, length - 1, I2C_MASTER_ACK);
-    }
-    i2c_master_read_byte(cmd, data + length - 1, I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-
-    esp_err_t ret = i2c_master_cmd_begin(i2cPort, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
+    // Combined write-register-address + read in a single transaction so a
+    // repeated-start is emitted on the bus (required by the MPU register map).
+    esp_err_t ret = i2c_master_transmit_receive(dev, &reg, 1, data, length, MPU9250_I2C_TIMEOUT_MS);
 
     if (ret != ESP_OK)
     {
         errorCount++;
-        ESP_LOGD(TAG_MPU9250, "Read registers failed: device=0x%02x, reg=0x%02x, len=%d, err=%d", addr, reg, length, ret);
+        ESP_LOGD(TAG_MPU9250, "Read registers failed: reg=0x%02x, len=%d, err=%d", reg, length, ret);
     }
     else
     {
@@ -226,7 +240,7 @@ esp_err_t MPU9250::readRegisters(uint8_t addr, uint8_t reg, uint8_t length, uint
 float MPU9250::readAccel(uint8_t axisOffset)
 {
     uint8_t rawData[2] = {0};
-    if (readRegisters(MPU9250_ADDR, MPU9250_ACCEL_XOUT_H + axisOffset, 2, rawData) == ESP_OK)
+    if (readRegisters(mpuDev, MPU9250_ACCEL_XOUT_H + axisOffset, 2, rawData) == ESP_OK)
     {
         int16_t value = (((int16_t)rawData[0]) << 8) | rawData[1];
         // Scale for ±4g range
@@ -238,7 +252,7 @@ float MPU9250::readAccel(uint8_t axisOffset)
 float MPU9250::readGyro(uint8_t axisOffset)
 {
     uint8_t rawData[2] = {0};
-    if (readRegisters(MPU9250_ADDR, MPU9250_GYRO_XOUT_H + axisOffset, 2, rawData) == ESP_OK)
+    if (readRegisters(mpuDev, MPU9250_GYRO_XOUT_H + axisOffset, 2, rawData) == ESP_OK)
     {
         int16_t value = (((int16_t)rawData[0]) << 8) | rawData[1];
         // Scale for ±1000 dps range
@@ -254,13 +268,13 @@ float MPU9250::readMag(uint8_t axisOffset)
 
     // Check data ready
     uint8_t st1;
-    if (readRegisters(AK8963_ADDR, AK8963_ST1, 1, &st1) != ESP_OK || !(st1 & 0x01))
+    if (readRegisters(magDev, AK8963_ST1, 1, &st1) != ESP_OK || !(st1 & 0x01))
     {
         return 0.0f;
     }
 
     uint8_t rawData[2] = {0};
-    if (readRegisters(AK8963_ADDR, AK8963_HXL + axisOffset, 2, rawData) == ESP_OK)
+    if (readRegisters(magDev, AK8963_HXL + axisOffset, 2, rawData) == ESP_OK)
     {
         int16_t value = (((int16_t)rawData[1]) << 8) | rawData[0]; // Little endian
 
@@ -296,7 +310,7 @@ void MPU9250::readAllSensors()
 
         // Read temperature
         uint8_t rawData[2] = {0};
-        if (readRegisters(MPU9250_ADDR, 0x41, 2, rawData) == ESP_OK)
+        if (readRegisters(mpuDev, 0x41, 2, rawData) == ESP_OK)
         {
             int16_t tempRaw = (((int16_t)rawData[0]) << 8) | rawData[1];
             temperature = (float)tempRaw / 333.87f + 21.0f;
@@ -524,7 +538,7 @@ void MPU9250::sensorTask(void *arg)
         // (14 octets : 6 Accel, 2 Temp, 6 Gyro)
         // Registre de départ : 0x3B (ACCEL_XOUT_H)
         uint8_t buffer[14];
-        if (sensor->readRegisters(MPU9250_ADDR, 0x3B, 14, buffer) == ESP_OK)
+        if (sensor->readRegisters(sensor->mpuDev, 0x3B, 14, buffer) == ESP_OK)
         {
             int16_t ax = (buffer[0] << 8) | buffer[1];
             int16_t ay = (buffer[2] << 8) | buffer[3];
@@ -553,11 +567,11 @@ void MPU9250::sensorTask(void *arg)
         {
             uint8_t st1;
             // If data ready
-            if (sensor->readRegisters(AK8963_ADDR, 0x02, 1, &st1) == ESP_OK && (st1 & 0x01))
+            if (sensor->readRegisters(sensor->magDev, 0x02, 1, &st1) == ESP_OK && (st1 & 0x01))
             {
                 uint8_t magBuf[7];
                 // 7 octets : 6 pour XYZ + 1 octet final state (ST2)
-                if (sensor->readRegisters(AK8963_ADDR, 0x03, 7, magBuf) == ESP_OK)
+                if (sensor->readRegisters(sensor->magDev, 0x03, 7, magBuf) == ESP_OK)
                 {
                     // Check overflow mag
                     if (!(magBuf[6] & 0x08)) 

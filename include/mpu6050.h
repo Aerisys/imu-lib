@@ -6,7 +6,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_check.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include <math.h>
 #include <string.h>
 #include <cfloat>
@@ -60,10 +60,20 @@ public:
         MAHONY_QUAT
     };
 
+    // Optional initialization parameters (see MPU9250::Config for rationale).
+    // The MPU6050 has no magnetometer, so only the MPU address is configurable.
+    struct Config
+    {
+        uint8_t  mpuAddr    = 0x68;
+        uint32_t sclSpeedHz = 100000;
+    };
+
     MPU6050();
     ~MPU6050();
 
-    esp_err_t init(i2c_port_t i2cPort, uint8_t sdaPin, uint8_t sclPin);
+    // The bus is owned by the CALLER; this class only adds itself as a device.
+    // See MPU9250::init for the full rationale and a usage example.
+    esp_err_t init(i2c_master_bus_handle_t busHandle, const Config& config = {});
     esp_err_t calibrate();
     esp_err_t setFilterMode(FilterMode mode);
     esp_err_t startSensorTask();
@@ -93,7 +103,10 @@ private:
     void performCalibration();
     void resetCalibration();
 
-    i2c_port_t i2cPort;
+    // I2C bus owned by the caller; the device handle is created in init().
+    i2c_master_bus_handle_t busHandle;
+    i2c_master_dev_handle_t mpuDev;
+
     TaskHandle_t taskHandle;
     SemaphoreHandle_t dataMutex;
     uint32_t lastProcessTime;

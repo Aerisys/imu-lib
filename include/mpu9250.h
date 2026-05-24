@@ -6,7 +6,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include <math.h>
 #include <string.h>
 #include <cfloat>
@@ -146,6 +146,21 @@ public:
         MAHONY
     };
 
+    // The `Config` struct groups all the optional initialization parameters
+    // for the sensor. It is passed to the `init` method.
+    //
+    // - mpuAddr   : I2C address of the MPU9250 itself. 0x68 (AD0=GND) or 0x69 (AD0=VCC).
+    // - magAddr   : I2C address of the AK8963 magnetometer. Fixed at 0x0C on MPU9250.
+    // - sclSpeedHz: SCL clock used for both the MPU and the AK8963 device handles.
+    //               100 kHz (Standard Mode) by default. The MPU9250 supports up to
+    //               400 kHz (Fast Mode); see the project README for performance notes.
+    struct Config
+    {
+        uint8_t  mpuAddr    = 0x68;
+        uint8_t  magAddr    = 0x0C;
+        uint32_t sclSpeedHz = 100000;
+    };
+
     // Constructor and Destructor
     MPU9250();
     ~MPU9250();
@@ -154,10 +169,29 @@ public:
     // These methods are used to initialize the sensor, start the sensor task, perform calibration,
     // retrieve sensor data, and check the sensor health status.
 
-    // The `init` method initializes the I2C communication and configures the sensor.
-    // It takes the I2C port number, SDA pin number, and SCL pin number as parameters.
-    // It returns an ESP error code indicating the success or failure of the initialization.
-    esp_err_t init(i2c_port_t i2cPort, uint8_t sdaPin, uint8_t sclPin);
+    // The `init` method configures the MPU9250 (and AK8963 magnetometer if present)
+    // on an I2C bus that is OWNED AND ALREADY INITIALIZED BY THE CALLER.
+    //
+    // The library does NOT install the I2C driver itself: this lets multiple
+    // devices (baro, OSD, ...) share the same bus from the consumer project,
+    // and stays compatible with the new ESP-IDF v5 i2c_master driver.
+    //
+    // Typical usage:
+    //   i2c_master_bus_config_t busCfg = {
+    //       .i2c_port = I2C_NUM_0,
+    //       .sda_io_num = GPIO_NUM_21,
+    //       .scl_io_num = GPIO_NUM_22,
+    //       .clk_source = I2C_CLK_SRC_DEFAULT,
+    //       .glitch_ignore_cnt = 7,
+    //       .flags = { .enable_internal_pullup = true },
+    //   };
+    //   i2c_master_bus_handle_t bus;
+    //   ESP_ERROR_CHECK(i2c_new_master_bus(&busCfg, &bus));
+    //   imu.init(bus);
+    //
+    // The destructor removes only the MPU/AK8963 device handles from the bus;
+    // the bus itself remains owned by the caller.
+    esp_err_t init(i2c_master_bus_handle_t busHandle, const Config& config = {});
 
     // The `calibrate` method performs calibration of the accelerometer, gyroscope, and magnetometer.
     // It collects a specified number of samples and computes the offsets for each sensor.
@@ -232,8 +266,10 @@ public:
     esp_err_t setSwitchRollPitch(bool switchRollPitch);
 private:
     // I2C Communication
-    esp_err_t writeRegister(uint8_t addr, uint8_t reg, uint8_t data);
-    esp_err_t readRegisters(uint8_t addr, uint8_t reg, uint8_t length, uint8_t *data);
+    // The `dev` handle selects which device on the bus is addressed
+    // (mpuDev for the MPU9250 itself, magDev for the AK8963 magnetometer).
+    esp_err_t writeRegister(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t data);
+    esp_err_t readRegisters(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t length, uint8_t *data);
 
     // Sensor Reading
     float readAccel(uint8_t axisOffset);
@@ -254,7 +290,13 @@ private:
     void resetCalibration();
 
     // Variables
-    i2c_port_t i2cPort;
+    // I2C bus and device handles. The bus is owned by the CALLER (not freed
+    // by this class). The two device handles are created in `init` and
+    // released in the destructor via `i2c_master_bus_rm_device`.
+    i2c_master_bus_handle_t busHandle;
+    i2c_master_dev_handle_t mpuDev;
+    i2c_master_dev_handle_t magDev;
+
     TaskHandle_t taskHandle;
     SemaphoreHandle_t dataMutex;
 
