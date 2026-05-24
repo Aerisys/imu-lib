@@ -139,14 +139,48 @@ public:
     //               wakeups the tick rate only bounds the timeout fallback,
     //               not the nominal loop, so a lower tick still works but the
     //               watchdog/fallback resolution is coarser.
+    // - taskCoreId  : Core to pin the internal sensor task to.
+    //                 - `tskNO_AFFINITY` (default) : the FreeRTOS scheduler
+    //                   may migrate the task between cores. Acceptable when
+    //                   networking (Wi-Fi/BLE) is disabled or pinned elsewhere.
+    //                 - `APP_CPU_NUM` (= 1) : recommended for drone control
+    //                   alongside a PID task on the same core, with the
+    //                   ESP-IDF Wi-Fi/lwIP stack pinned to `PRO_CPU_NUM`.
+    //                 - `PRO_CPU_NUM` (= 0) : reverse split, less common.
+    //                 Pinning trades a small loss of scheduler flexibility
+    //                 for deterministic timing — useful when Wi-Fi ISRs
+    //                 occasionally inject ~50 us of jitter into the IMU
+    //                 loop.
+    // - taskPriority: FreeRTOS priority for the sensor task. Default 5 is
+    //                 high enough to preempt typical user tasks but below
+    //                 most ESP-IDF system tasks. The PID task in your drone
+    //                 firmware should sit ONE step BELOW this value so the
+    //                 IMU always wins on a DATA_READY interrupt, and the
+    //                 PID immediately preempts other work once a snapshot
+    //                 is published.
+    // - taskStackSize: Stack size (in bytes) for the sensor task. Default
+    //                  4096 leaves comfortable margin for the current code
+    //                  paths (~1.5 kB observed peak with Mahony 9-DOF). Raise
+    //                  it only if you add custom logic via subclassing or
+    //                  hit a stack overflow in `uxTaskGetStackHighWaterMark`.
+    //                  Lowering below 3072 risks overflow when the profiler
+    //                  is enabled (large `ESP_LOGI` format buffers on stack).
     struct Config
     {
-        uint8_t    mpuAddr    = 0x68;
-        uint8_t    magAddr    = 0x0C;
-        uint32_t   sclSpeedHz = 400000;        // Fast Mode (see notes above)
-        gpio_num_t intPin     = GPIO_NUM_NC;
+        uint8_t     mpuAddr       = 0x68;
+        uint8_t     magAddr       = 0x0C;
+        uint32_t    sclSpeedHz    = 400000;        // Fast Mode (see notes above)
+        gpio_num_t  intPin        = GPIO_NUM_NC;
+        BaseType_t  taskCoreId    = tskNO_AFFINITY;
+        UBaseType_t taskPriority  = 5;
+        uint32_t    taskStackSize = 4096;
 
-        Config() : mpuAddr(0x68), magAddr(0x0C), sclSpeedHz(400000), intPin(GPIO_NUM_NC) {}
+        Config()
+            : mpuAddr(0x68), magAddr(0x0C), sclSpeedHz(400000),
+              intPin(GPIO_NUM_NC),
+              taskCoreId(tskNO_AFFINITY), taskPriority(5),
+              taskStackSize(4096)
+        {}
     };
 
     // Constructor and Destructor
@@ -432,6 +466,12 @@ private:
     // GPIO pin wired to the MPU9250 INT (DATA_READY) line. GPIO_NUM_NC means
     // the polling fallback is used in the sensor task.
     gpio_num_t intPin;
+
+    // FreeRTOS task placement, captured from Config in init() and consumed
+    // by startSensorTask() when creating the sensor task.
+    BaseType_t  taskCoreId;
+    UBaseType_t taskPriority;
+    uint32_t    taskStackSize;
 
     TaskHandle_t taskHandle;
     // dataMutex still guards INTERNAL mutations (calibration writes,

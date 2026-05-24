@@ -153,6 +153,29 @@ void controlTask(void* arg) {
 }
 ```
 
+### Architecture FreeRTOS recommandée (drone ESP32 dual-core)
+
+La lib crée sa propre task `mpu9250_task` au sein de `startSensorTask()` — pas de polling à faire toi-même. Configure son **core** et sa **priorité** via `Config::taskCoreId` / `taskPriority` selon ton scénario :
+
+| Tâche | Priorité | Core | Notes |
+|---|---|---|---|
+| **IMU sensor** (cette lib) | `5` (default) | `APP_CPU_NUM` | `cfg.taskCoreId = APP_CPU_NUM;` |
+| **PID / control** (firmware) | `4` (= IMU – 1) | `APP_CPU_NUM` | sync via `waitForNewSample()`, **lockstep** avec l'IMU |
+| **Wi-Fi / lwIP** (ESP-IDF) | défaut | `PRO_CPU_NUM` | via `sdkconfig` : `CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y`, `CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y` |
+| **Telemetry / MQTT / log** | `2` | `PRO_CPU_NUM` | basse cadence, accède `getSnapshot()` à la demande |
+
+**Principe** : core 1 (APP_CPU) = temps réel deterministe, core 0 (PRO_CPU) = networking. Sans cette séparation, les ISR Wi-Fi peuvent injecter ~50 µs de jitter dans la boucle PID.
+
+```cpp
+MPU9250::Config cfg;
+cfg.intPin       = GPIO_NUM_19;
+cfg.taskCoreId   = APP_CPU_NUM;   // pinne la sensor task sur le core "temps réel"
+cfg.taskPriority = 5;              // ton PID doit être à 4
+imu.init(bus, cfg);
+```
+
+> Pour le bench standalone sans Wi-Fi : laisse `tskNO_AFFINITY` (default). Le pinning ne devient utile que dès que des stacks lourds (Wi-Fi/BLE) entrent en jeu.
+
 ---
 
 ## API publique (résumé)
@@ -204,10 +227,13 @@ class IMUSensor {
 class MPU9250 : public IMUSensor {
     // Init (Config sensor-spécifique)
     struct Config {
-        uint8_t    mpuAddr    = 0x68;
-        uint8_t    magAddr    = 0x0C;
-        uint32_t   sclSpeedHz = 400000;
-        gpio_num_t intPin     = GPIO_NUM_NC; // GPIO_NUM_NC = polling fallback
+        uint8_t     mpuAddr       = 0x68;
+        uint8_t     magAddr       = 0x0C;
+        uint32_t    sclSpeedHz    = 400000;
+        gpio_num_t  intPin        = GPIO_NUM_NC;     // GPIO_NUM_NC = polling fallback
+        BaseType_t  taskCoreId    = tskNO_AFFINITY;  // ou APP_CPU_NUM (1) / PRO_CPU_NUM (0)
+        UBaseType_t taskPriority  = 5;               // FreeRTOS prio de la sensor task
+        uint32_t    taskStackSize = 4096;            // stack en octets (3072 mini avec profiler)
     };
     esp_err_t init(i2c_master_bus_handle_t bus, const Config& = {});
 
