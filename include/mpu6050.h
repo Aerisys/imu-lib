@@ -99,7 +99,9 @@ private:
     void updateComplementaryFilter(float dt);
     void updateMahonyFilter(float dt);
     void updateMahonyQuat(float dt);
-    void computeAnglesFromAccel();
+    // computeAnglesFromAccel(): removed — was declared but never defined nor
+    // called; the filter paths derive roll/pitch directly from accel inside
+    // updateComplementaryFilter / updateMahonyFilter.
 
     void performCalibration();
     void resetCalibration();

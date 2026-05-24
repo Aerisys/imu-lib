@@ -5,6 +5,15 @@
 // the sensor task does not hang on a wire fault.
 #define MPU9250_I2C_TIMEOUT_MS 100
 
+// Enable the per-loop profiler block in sensorTask. Off by default to avoid
+// polluting the production log stream and to remove the small per-iteration
+// overhead of esp_timer_get_time() calls. Override from build:
+//   PlatformIO: build_flags = -DMPU9250_PROFILER=1
+//   ESP-IDF   : idf_component_register(... PRIV_REQUIRES ... PRIV_REQ_CFG)
+#ifndef MPU9250_PROFILER
+#define MPU9250_PROFILER 0
+#endif
+
 // Implementation
 MPU9250::MPU9250()
     : busHandle(nullptr),
@@ -32,7 +41,11 @@ MPU9250::MPU9250()
       filterMode(COMPLEMENTARY),
       q{1.0f, 0.0f, 0.0f, 0.0f}, // Identity quaternion (no rotation)
       mahonyKp(MAHONY_KP),
-      mahonyKi(MAHONY_KI)
+      mahonyKi(MAHONY_KI),
+      // Explicit default for switchRollPitch: previously left uninitialised,
+      // which read as garbage on the first processMeasurements() call before
+      // setSwitchRollPitch() was invoked by the user.
+      switchRollPitch(false)
 {
     memset(magAdjustValues, 0, sizeof(magAdjustValues));
     dataMutex = xSemaphoreCreateMutex();
@@ -312,50 +325,11 @@ float MPU9250::readMag(uint8_t axisOffset)
     return 0.0f;
 }
 
-void MPU9250::readAllSensors()
-{
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-    {
-        // Read accelerometer
-        accel.x = invertAxis.x * (readAccel(0) - accelOffset.x);
-        accel.y = invertAxis.y * (readAccel(2) - accelOffset.y);
-        accel.z = invertAxis.z * (readAccel(4) - accelOffset.z);
-
-        // Read gyroscope
-        gyro.x = invertAxis.x * (readGyro(0) - gyroOffset.x);
-        gyro.y = invertAxis.y * (readGyro(2) - gyroOffset.y);
-        gyro.z = invertAxis.z * (readGyro(4) - gyroOffset.z);
-
-        // Read magnetometer if available
-        if (magAvailable)
-        {
-            mag.x = invertAxis.x * ((readMag(0) - magOffset.x) * magScale.x);
-            mag.y = invertAxis.y * ((readMag(2) - magOffset.y) * magScale.y);
-            mag.z = invertAxis.z * ((readMag(4) - magOffset.z) * magScale.z);
-        }
-
-        // Read temperature
-        uint8_t rawData[2] = {0};
-        if (readRegisters(mpuDev, 0x41, 2, rawData) == ESP_OK)
-        {
-            int16_t tempRaw = (((int16_t)rawData[0]) << 8) | rawData[1];
-            temperature = (float)tempRaw / 333.87f + 21.0f;
-        }
-
-        xSemaphoreGive(dataMutex);
-    }
-}
-
-void MPU9250::computeAnglesFromAccel()
-{
-    // Calculate roll/pitch from accelerometer
-    float rollAcc = atan2f(accel.y, accel.z) * RAD_TO_DEG;
-    float pitchAcc = atan2f(-accel.x, sqrtf(accel.y * accel.y + accel.z * accel.z)) * RAD_TO_DEG;
-
-    // Store in temporary variables for filter update
-    orientation.roll = rollAcc;
-    orientation.pitch = pitchAcc;
-}
+// NOTE: `readAllSensors()` and `computeAnglesFromAccel()` were removed in the
+// MPU9250 refactor — the hot loop in `sensorTask` does an inline 14-byte
+// burst read (much faster than 3 single-axis I2C transactions per sensor),
+// and the Mahony / complementary filters compute attitude from accel + gyro
+// + mag directly. Neither helper was on any code path.
 
 float MPU9250::computeHeadingFromMag()
 {
@@ -589,10 +563,15 @@ void MPU9250::sensorTask(void *arg)
     MPU9250 *sensor = static_cast<MPU9250 *>(arg);
     int64_t lastTime = esp_timer_get_time();
 
-    uint32_t loopCount = 0;
-    int64_t totalI2cTime = 0;
-    int64_t totalMathTime = 0;
-    int64_t maxI2cTime = 0; // Pour capter le pire scénario (jitter)
+#if MPU9250_PROFILER
+    // Per-loop timing accumulators. Compiled out by default; enable via
+    // -DMPU9250_PROFILER=1 in the consumer build flags when investigating
+    // jitter or I2C budget on a new airframe.
+    uint32_t loopCount     = 0;
+    int64_t  totalI2cTime  = 0;
+    int64_t  totalMathTime = 0;
+    int64_t  maxI2cTime    = 0;
+#endif
 
     ESP_LOGI(TAG_MPU9250, "Sensor task started");
 
@@ -606,8 +585,9 @@ void MPU9250::sensorTask(void *arg)
         // No division by 0
         if (dt <= 0.0f) dt = 0.01f;
 
-        // Read sensor data
-        // sensor->readAllSensors();
+        // Read sensor data — inline burst for the hot path (one I2C transaction
+        // covers the 14 contiguous accel+temp+gyro bytes, vs. 7 separate ones
+        // if we used readAccel/readGyro helpers).
         Vector3 loc_accel = {0.0f, 0.0f, 0.0f};
         Vector3 loc_gyro  = {0.0f, 0.0f, 0.0f};
         Vector3 loc_mag   = {0.0f, 0.0f, 0.0f};
@@ -620,7 +600,9 @@ void MPU9250::sensorTask(void *arg)
         // iteration, which broke the Mahony 9-DOF correction completely.
         bool magNewSample = false;
 
+#if MPU9250_PROFILER
         int64_t startI2c = esp_timer_get_time();
+#endif
 
         // (14 octets : 6 Accel, 2 Temp, 6 Gyro)
         // Registre de départ : 0x3B (ACCEL_XOUT_H)
@@ -680,12 +662,14 @@ void MPU9250::sensorTask(void *arg)
             }
         }
 
+#if MPU9250_PROFILER
         int64_t endI2c = esp_timer_get_time();
         int64_t currentI2cTime = endI2c - startI2c;
         totalI2cTime += currentI2cTime;
         if (currentI2cTime > maxI2cTime) maxI2cTime = currentI2cTime;
 
         int64_t startMath = esp_timer_get_time();
+#endif
 
         if (newDataReady)
         {
@@ -712,14 +696,12 @@ void MPU9250::sensorTask(void *arg)
             }
         }
 
+#if MPU9250_PROFILER
         totalMathTime += (esp_timer_get_time() - startMath);
 
         loopCount++;
-        // The profiler logs once per `kProfilerWindow` loops. With the
-        // INT-driven path running at 1 kHz this stays close to a 1-second
-        // cadence; with the polling fallback (~100 Hz) it logs every 5 s.
-        // Point 6 of the refactor plan will gate this block behind a build
-        // flag — for now it stays on to validate the rate change.
+        // Logs once per `kProfilerWindow` loops. At 1 kHz INT-driven that
+        // is roughly every 0.5 s; at ~100 Hz polling fallback every 5 s.
         constexpr uint32_t kProfilerWindow = 500;
         if (loopCount >= kProfilerWindow)
         {
@@ -733,6 +715,7 @@ void MPU9250::sensorTask(void *arg)
             totalMathTime = 0;
             maxI2cTime = 0;
         }
+#endif
 
         // -------------------------------------------------------------------
         // Wait for the next sample.
