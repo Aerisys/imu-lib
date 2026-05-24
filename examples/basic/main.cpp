@@ -39,9 +39,16 @@ extern "C" void app_main()
 
     // 2. Initialize the IMU on that bus. The library attaches its own device
     //    handles to the bus but does not own the bus itself.
+    //
+    //    The MPU9250 INT pin is wired to GPIO 19 here: this enables the
+    //    interrupt-driven sample loop (1 kHz at default DLPF settings).
+    //    Set `intPin = GPIO_NUM_NC` to keep the legacy 100 Hz polling
+    //    behaviour when the INT line is not connected.
     static MPU9250 imu;
 
-    err = imu.init(bus); // default Config: 0x68 / 0x0C / 100 kHz
+    MPU9250::Config cfg;
+    cfg.intPin = GPIO_NUM_19;
+    err = imu.init(bus, cfg);
     if (err != ESP_OK)
     {
         ESP_LOGE("APP", "Failed to initialize MPU9250 (err=%d)", err);
