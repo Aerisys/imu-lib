@@ -62,10 +62,11 @@ public:
 
     // Optional initialization parameters (see MPU9250::Config for rationale).
     // The MPU6050 has no magnetometer, so only the MPU address is configurable.
+    // Default SCL clock is 400 kHz (Fast Mode), supported by the MPU6050.
     struct Config
     {
         uint8_t  mpuAddr    = 0x68;
-        uint32_t sclSpeedHz = 100000;
+        uint32_t sclSpeedHz = 400000;
     };
 
     MPU6050();
