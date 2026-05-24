@@ -39,7 +39,8 @@ using std::min;
 #define RAD_TO_DEG 57.2957795f
 #define DEG_TO_RAD 0.0174532925f
 #define GRAVITY 9.80665f
-#define CALIBRATION_SAMPLES 1000
+#define CALIBRATION_SAMPLES     1000  // 10 s at 100 Hz, sensor immobile
+#define MAG_CALIBRATION_SAMPLES 3000  // 30 s at 100 Hz, sensor rotated
 #define FILTER_ALPHA 0.96f // Complementary filter constant
 // Default Mahony AHRS gains. These can be overridden at runtime through
 // setMahonyGains(). Ki is intentionally 0.0 by default: on a drone, a
@@ -178,12 +179,47 @@ public:
     // the bus itself remains owned by the caller.
     esp_err_t init(i2c_master_bus_handle_t busHandle, const Config& config = {});
 
-    // The `calibrate` method performs calibration of the accelerometer, gyroscope, and magnetometer.
-    // It collects a specified number of samples and computes the offsets for each sensor.
-    // The calibration process is performed in the background and can take some time.
-    // The method returns an ESP error code indicating the success or failure of the calibration.
-    // The calibration status can be monitored using the `getCalibrationStatus` method.
+    // -------------------------------------------------------------------------
+    // calibrate() — fulfils the IMUSensor interface contract by performing
+    // ONLY the gyro+accel calibration (alias of calibrateGyroAccel below).
+    //
+    // CHANGE vs. v1.0: previously this method also attempted a magnetometer
+    // calibration in the same 10-second window, while telling the user to
+    // "keep the sensor still" — instructions impossible to satisfy together
+    // (mag calibration needs the sensor rotated through every axis). The
+    // mag calibration is now a separate explicit call (`calibrateMag()`).
+    // -------------------------------------------------------------------------
     esp_err_t calibrate() override;
+
+    // -------------------------------------------------------------------------
+    // calibrateGyroAccel — captures the static gyro bias and the accelerometer
+    // 1g reference. The sensor must stay IMMOBILE for ~10 seconds (1000 samples
+    // at 100 Hz internal). At the end:
+    //   - gyroOffset, accelOffset, gyroCalibTemp are updated
+    //   - the calibration is auto-persisted to NVS
+    //   - calibStatus transitions NOT_CALIBRATED -> CALIBRATING -> CALIBRATED
+    //
+    // This is the sensible default to run at first boot (or whenever
+    // `getCalibrationStatus() != CALIBRATED` after `init()` loaded NVS).
+    // It runs asynchronously in its own task; poll `getCalibrationStatus()`.
+    // -------------------------------------------------------------------------
+    esp_err_t calibrateGyroAccel();
+
+    // -------------------------------------------------------------------------
+    // calibrateMag — captures the hard-iron (offset) and soft-iron (scale)
+    // corrections of the AK8963 magnetometer. The sensor must be ROTATED
+    // through every orientation (figure-8 motion on all three axes) for ~30
+    // seconds (3000 samples at 100 Hz internal). At the end:
+    //   - magOffset and magScale are updated
+    //   - the calibration is auto-persisted to NVS
+    //   - calibStatus is NOT changed (mag-only calibration does not affect
+    //     gyro/accel readiness)
+    //
+    // This is typically done ONCE during initial drone setup, not at every
+    // boot. Returns ESP_ERR_NOT_SUPPORTED if no magnetometer was detected
+    // at init(). Runs asynchronously in its own task.
+    // -------------------------------------------------------------------------
+    esp_err_t calibrateMag();
 
     // The `setFilterMode` method sets the filter mode for orientation calculation.
     // It takes a `FilterMode` enum value as a parameter and sets the filter mode accordingly.
@@ -320,10 +356,11 @@ public:
     // is stored, ESP_ERR_NVS_NOT_INITIALIZED if the consumer never initialised
     // NVS, or another esp_err_t on I/O failure.
     //
-    // `saveCalibration()` is called automatically at the end of
-    // `performCalibration()` once new offsets have been computed. You only
-    // need to call it manually after `setGyroTempCompCoeff()` if you want
-    // the new coefficient persisted without re-running a full calibration.
+    // `saveCalibration()` is called automatically at the end of both
+    // `calibrateGyroAccel()` and `calibrateMag()` once new offsets have been
+    // computed. You only need to call it manually after
+    // `setGyroTempCompCoeff()` if you want the new coefficient persisted
+    // without re-running a full calibration.
     //
     // `clearStoredCalibration()` erases the blob. Useful to force a fresh
     // calibration on the next boot (e.g. after swapping the sensor module).
@@ -375,9 +412,12 @@ private:
     void updateMahonyFilter(float dt);
     float computeHeadingFromMag();
 
-    // Calibration
-    void performCalibration();
-    void resetCalibration();
+    // Calibration — split into two independent paths since gyro/accel and
+    // mag have contradictory user instructions (immobile vs. rotated).
+    void performGyroAccelCalibration();
+    void performMagCalibration();
+    void resetGyroAccelOffsets();
+    void resetMagOffsets();
 
     // Variables
     // I2C bus and device handles. The bus is owned by the CALLER (not freed
