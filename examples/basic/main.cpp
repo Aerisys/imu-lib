@@ -65,6 +65,16 @@ extern "C" void app_main()
 
     MPU9250::Config cfg;
     cfg.intPin = GPIO_NUM_19;
+    // Optional: pin the internal sensor task to a specific core.
+    //   tskNO_AFFINITY (default) lets the scheduler migrate the task — fine
+    //   for bench testing without Wi-Fi.
+    //   On a drone with Wi-Fi/BLE running, prefer APP_CPU_NUM (= 1) and pin
+    //   the IDF networking stack to PRO_CPU_NUM via sdkconfig:
+    //     CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
+    //     CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+    //
+    //   cfg.taskCoreId   = APP_CPU_NUM;
+    //   cfg.taskPriority = 5;
     err = imu.init(bus, cfg);
     if (err != ESP_OK)
     {

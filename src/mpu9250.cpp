@@ -57,6 +57,9 @@ MPU9250::MPU9250()
       mpuDev(nullptr),
       magDev(nullptr),
       intPin(GPIO_NUM_NC),
+      taskCoreId(tskNO_AFFINITY),
+      taskPriority(5),
+      taskStackSize(4096),
       taskHandle(nullptr),
       dataMutex(nullptr),
       sampleSem(nullptr),
@@ -154,8 +157,11 @@ esp_err_t MPU9250::init(i2c_master_bus_handle_t bus, const Config& config)
         return ESP_ERR_INVALID_ARG;
     }
 
-    busHandle = bus;
-    intPin = config.intPin;
+    busHandle     = bus;
+    intPin        = config.intPin;
+    taskCoreId    = config.taskCoreId;
+    taskPriority  = config.taskPriority;
+    taskStackSize = config.taskStackSize;
 
     // Attach the MPU9250 itself as a device on the bus.
     i2c_device_config_t mpuCfg = {};
@@ -943,19 +949,33 @@ void IRAM_ATTR MPU9250::dataReadyIsr(void *arg)
 
 esp_err_t MPU9250::startSensorTask()
 {
-    BaseType_t ret = xTaskCreate(
+    // xTaskCreatePinnedToCore accepts `tskNO_AFFINITY` as the core ID,
+    // which is equivalent to the legacy `xTaskCreate` behaviour (the
+    // scheduler may run the task on either core). Using the pinned API
+    // unconditionally lets us cover both "no pinning" and "pinned to a
+    // specific core" with a single call path.
+    BaseType_t ret = xTaskCreatePinnedToCore(
         sensorTask,
         "mpu9250_task",
-        4096,
+        taskStackSize,
         this,
-        5,
-        &taskHandle);
+        taskPriority,
+        &taskHandle,
+        taskCoreId);
 
     if (ret != pdPASS)
     {
-        ESP_LOGE(TAG_MPU9250, "Failed to create sensor task");
+        ESP_LOGE(TAG_MPU9250, "Failed to create sensor task (prio=%u, core=%d, stack=%u)",
+                 (unsigned)taskPriority, (int)taskCoreId, (unsigned)taskStackSize);
         return ESP_FAIL;
     }
+
+    if (taskCoreId == tskNO_AFFINITY)
+        ESP_LOGI(TAG_MPU9250, "Sensor task created (prio=%u, stack=%u, core=any)",
+                 (unsigned)taskPriority, (unsigned)taskStackSize);
+    else
+        ESP_LOGI(TAG_MPU9250, "Sensor task created (prio=%u, stack=%u, pinned to core %d)",
+                 (unsigned)taskPriority, (unsigned)taskStackSize, (int)taskCoreId);
 
     // If the user provided an INT pin, wire it up to drive the sensor task.
     // The order matters:

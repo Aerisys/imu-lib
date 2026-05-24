@@ -84,7 +84,10 @@ extern "C" void app_main()
     // 3. IMU
     static MPU9250 imu;
     MPU9250::Config cfg;
-    cfg.intPin = GPIO_NUM_19;    // 1 kHz INT-driven (GPIO_NUM_NC = polling 100 Hz)
+    cfg.intPin        = GPIO_NUM_19;    // 1 kHz INT-driven (GPIO_NUM_NC = polling 100 Hz)
+    cfg.taskCoreId    = APP_CPU_NUM;    // optionnel : core 1 = temps réel (sinon tskNO_AFFINITY)
+    cfg.taskPriority  = 5;              // optionnel : default 5. Le PID drone doit être à 4.
+    cfg.taskStackSize = 4096;           // optionnel : default 4096. Mini 3072 avec profiler.
     imu.init(bus, cfg);
 
     if (imu.getCalibrationStatus() != MPU9250::CALIBRATED)
@@ -133,7 +136,7 @@ imu.calibrateMag();   // 30 s de rotation figure-8 demandée à l'utilisateur
 
 ## Architecture interne — points clés à comprendre
 
-### Sensor task (priorité 5, stack 4096)
+### Sensor task (priorité, stack, core tous configurables via `Config`)
 
 ```
 boucle :
@@ -178,6 +181,9 @@ boucle :
 - **Quaternion exposé**. Le PID drone *doit* l'utiliser plutôt que `getOrientation()` pour éviter gimbal lock à ±90° pitch (flips, loops, vol inversé). `getOrientation()` reste exposé pour debug humain.
 - **`MAHONY_KI = 0` par défaut**. Le `0.1` de la v1.0 causait du windup intégral sur manœuvres agressives drone (bias latché après chaque flip). Réactivable runtime via `setMahonyGains(kp, ki)` si dérive gyro mesurée en vol nécessite Ki > 0.
 - **`switchRollPitch` initialisé `false`** dans le constructeur (était indéterminé → UB en v1.0).
+- **Sensor task pinning** : la lib utilise `xTaskCreatePinnedToCore` avec `Config::taskCoreId` (default `tskNO_AFFINITY` = scheduler libre). Pour drone avec Wi-Fi actif, pinner sur `APP_CPU_NUM` ET pinner le stack IDF networking sur `PRO_CPU_NUM` via `sdkconfig` (`CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y`, `CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y`). Sinon ~50 µs de jitter occasionnel sur l'IMU.
+- **Priorité IMU vs PID** : le PID du consommateur doit être à `taskPriority - 1` (default IMU=5, donc PID=4). Si égaux, la sensor task peut être préemptée par le PID juste après une publication — pas catastrophique grâce au seqlock, mais ajoute des retries inutiles côté reader.
+- **Stack sizing** : `Config::taskStackSize` default 4096 octets. Peak observé ~1.5 kB sur Mahony 9-DOF + ESP_LOG buffers. Si tu actives `MPU9250_PROFILER=1`, **ne descends pas sous 3072**. Pour mesurer en vol, `uxTaskGetStackHighWaterMark(taskHandle)` retourne le minimum jamais atteint.
 - **Calibration mag NON automatique**. `calibrate()` (interface) = `calibrateGyroAccel()` uniquement. Mag = `calibrateMag()` séparé, explicite, 30 s de figure-8.
 - **Persistance NVS auto** : `init()` appelle `loadCalibration()`, calib réussie appelle `saveCalibration()`. Le consommateur n'a pas besoin de gérer le storage.
 - **Versioning blob NVS** (`MPU9250_CALIB_VERSION`) : si on modifie le layout `CalibBlob` (anonyme dans `mpu9250.cpp`), **incrémenter** sinon les anciens blobs seront lus comme valides et corromperont les offsets. Le `static_assert` sur `sizeof(CalibBlob)` attrape les changements silencieux.
