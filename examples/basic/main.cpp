@@ -99,6 +99,18 @@ extern "C" void app_main()
     //   Ki kept at 0 to avoid integral windup during aggressive maneuvers.
     imu.setMahonyGains(1.0f, 0.0f);
 
+    // Optional: install a gyro notch filter on the motor fundamental.
+    //
+    // Measure the motor frequency with a vibration log at hover (e.g. log
+    // raw gyro on one axis for a few seconds and FFT it). For a 5" quad on
+    // 2306 motors hovering at ~50% throttle, the fundamental is often in
+    // the 150-250 Hz range. Bandwidth 40-80 Hz is a reasonable starting
+    // point — wider = more rejection but more phase lag in band.
+    //
+    // Comment this out until you have measured your airframe.
+    //
+    //   imu.setGyroNotch(200.0f /*centerHz*/, 60.0f /*bwHz*/, 1000.0f /*sampleRateHz*/);
+
     err = imu.startSensorTask();
     if (err != ESP_OK)
     {

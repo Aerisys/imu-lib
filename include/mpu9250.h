@@ -285,6 +285,30 @@ public:
     esp_err_t    waitForNewSample(uint32_t timeoutMs) override;
 
     // -------------------------------------------------------------------------
+    // Gyro notch filter (motor-vibration suppression)
+    // -------------------------------------------------------------------------
+    // Drones typically vibrate at the motor fundamental frequency (commonly
+    // 100-400 Hz for small quads, up to ~600 Hz for racers). The MPU9250's
+    // on-chip DLPF (set to ~41 Hz) suppresses higher harmonics but the
+    // fundamental still leaks into the gyro stream. Without rejection, the
+    // PID chases the vibration -> motor heating, oscillation, poor
+    // attitude hold.
+    //
+    // This installs a biquad notch (IIR, Direct Form II Transposed) on each
+    // gyro axis. Use `setGyroNotch` with the measured motor frequency at
+    // hover (e.g. RPM / 60 for a brushed motor, RPM * poles/2 / 60 for a
+    // BLDC, or measure with a vibration log). Bandwidth typically 30-80 Hz.
+    //
+    //   sampleRateHz must match what the sensor task is actually running at:
+    //     1000 Hz when DATA_READY interrupt is wired (default Config),
+    //     ~100 Hz in polling fallback (Config::intPin = GPIO_NUM_NC).
+    //
+    // `clearGyroNotch()` disables the filter (passthrough) and resets state.
+    // The filter is disabled by default — behaviour is unchanged until called.
+    esp_err_t setGyroNotch(float centerHz, float bandwidthHz, float sampleRateHz = 1000.0f);
+    esp_err_t clearGyroNotch();
+
+    // -------------------------------------------------------------------------
     // Calibration persistence (NVS)
     // -------------------------------------------------------------------------
     // The consumer project is responsible for initialising NVS once at startup
@@ -383,6 +407,17 @@ private:
     // values around their copy. One writer + N readers, lock-free reads.
     SampleBundle              publishedBundle;
     std::atomic<uint32_t>     bundleSeq;
+
+    // ---- Gyro notch biquad (Direct Form II Transposed) ---------------------
+    // Coefficients are recomputed in setGyroNotch() and stored here. The
+    // sensor task reads them at the top of each iteration into a local copy
+    // (so a mid-flight setGyroNotch never tears a single sample). State (z1,
+    // z2) is per-axis and only touched by the sensor task.
+    struct NotchCoeffs { float b0, b1, b2, a1, a2; };
+    struct NotchState  { float z1, z2; };
+    NotchCoeffs                gyroNotchCoeffs;
+    NotchState                 gyroNotchState[3];
+    std::atomic<bool>          gyroNotchEnabled;
 
     // Sensor Data
     Vector3 accel;
