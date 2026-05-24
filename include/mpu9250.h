@@ -329,11 +329,13 @@ private:
     esp_err_t writeRegister(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t data);
     esp_err_t readRegisters(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t length, uint8_t *data);
 
-    // Sensor Reading
+    // Sensor Reading (single-axis helpers kept for the calibration path).
+    // The hot-loop in sensorTask uses an inline 14-byte burst read for
+    // throughput; these helpers are only used during the (slow) calibration
+    // routine where readability matters more than per-read overhead.
     float readAccel(uint8_t axisOffset);
     float readGyro(uint8_t axisOffset);
     float readMag(uint8_t axisOffset);
-    void readAllSensors();
 
     // Sensor Processing
     static void sensorTask(void *arg);
@@ -346,7 +348,6 @@ private:
     void processMeasurements(float dt);
     void updateComplementaryFilter(float dt);
     void updateMahonyFilter(float dt);
-    void computeAnglesFromAccel();
     float computeHeadingFromMag();
 
     // Calibration
