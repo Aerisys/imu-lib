@@ -86,9 +86,12 @@ MPU9250::MPU9250()
       // setSwitchRollPitch() was invoked by the user.
       switchRollPitch(false),
       publishedBundle{},
-      bundleSeq(0)
+      bundleSeq(0),
+      gyroNotchCoeffs{1.0f, 0.0f, 0.0f, 0.0f, 0.0f}, // passthrough
+      gyroNotchEnabled(false)
 {
     memset(magAdjustValues, 0, sizeof(magAdjustValues));
+    memset(gyroNotchState, 0, sizeof(gyroNotchState));
     dataMutex = xSemaphoreCreateMutex();
     // Binary semaphore is created "empty" — first waitForNewSample() blocks
     // until the sensor task gives it after the first publish.
@@ -708,6 +711,35 @@ void MPU9250::sensorTask(void *arg)
             loc_gyro.x = sensor->invertAxis.x * ((gx / 32.8f) - gxOff);
             loc_gyro.y = sensor->invertAxis.y * ((gy / 32.8f) - gyOff);
             loc_gyro.z = sensor->invertAxis.z * ((gz / 32.8f) - gzOff);
+
+            // Gyro notch filter (motor-vibration suppression).
+            // Disabled by default — no-op until setGyroNotch() is called.
+            // We snapshot the atomic flag once per iteration, then apply a
+            // Direct Form II Transposed biquad per axis. State updates here
+            // are exclusive to this task, so no locking is needed.
+            if (sensor->gyroNotchEnabled.load(std::memory_order_acquire))
+            {
+                const NotchCoeffs c = sensor->gyroNotchCoeffs; // local copy
+                float in, out;
+
+                in  = loc_gyro.x;
+                out = c.b0 * in + sensor->gyroNotchState[0].z1;
+                sensor->gyroNotchState[0].z1 = c.b1 * in - c.a1 * out + sensor->gyroNotchState[0].z2;
+                sensor->gyroNotchState[0].z2 = c.b2 * in - c.a2 * out;
+                loc_gyro.x = out;
+
+                in  = loc_gyro.y;
+                out = c.b0 * in + sensor->gyroNotchState[1].z1;
+                sensor->gyroNotchState[1].z1 = c.b1 * in - c.a1 * out + sensor->gyroNotchState[1].z2;
+                sensor->gyroNotchState[1].z2 = c.b2 * in - c.a2 * out;
+                loc_gyro.y = out;
+
+                in  = loc_gyro.z;
+                out = c.b0 * in + sensor->gyroNotchState[2].z1;
+                sensor->gyroNotchState[2].z1 = c.b1 * in - c.a1 * out + sensor->gyroNotchState[2].z2;
+                sensor->gyroNotchState[2].z2 = c.b2 * in - c.a2 * out;
+                loc_gyro.z = out;
+            }
 
             newDataReady = true;
         }
@@ -1402,4 +1434,82 @@ esp_err_t MPU9250::waitForNewSample(uint32_t timeoutMs)
                                  ? portMAX_DELAY
                                  : pdMS_TO_TICKS(timeoutMs);
     return (xSemaphoreTake(sampleSem, ticks) == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+// -----------------------------------------------------------------------------
+// Gyro notch biquad — coefficient computation
+// -----------------------------------------------------------------------------
+// Standard notch from Robert Bristow-Johnson's "Audio EQ Cookbook":
+//
+//   w0    = 2*pi*f0/fs
+//   alpha = sin(w0) / (2*Q)         with Q = f0 / bandwidth
+//
+//   b0 = 1
+//   b1 = -2*cos(w0)
+//   b2 = 1
+//   a0 = 1 + alpha
+//   a1 = -2*cos(w0)
+//   a2 = 1 - alpha
+//
+// Then everything divided by a0 so a0 = 1 in the runtime form (DF-II-T).
+// -----------------------------------------------------------------------------
+
+esp_err_t MPU9250::setGyroNotch(float centerHz, float bandwidthHz, float sampleRateHz)
+{
+    if (centerHz <= 0.0f || bandwidthHz <= 0.0f || sampleRateHz <= 0.0f)
+    {
+        ESP_LOGE(TAG_MPU9250, "setGyroNotch: parameters must be positive");
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Nyquist sanity: a notch above fs/2 is meaningless. We clamp slightly
+    // below half-rate so the digital prewarp is well-conditioned.
+    if (centerHz >= 0.49f * sampleRateHz)
+    {
+        ESP_LOGE(TAG_MPU9250, "setGyroNotch: centerHz (%.1f) too close to Nyquist (%.1f)", centerHz, 0.5f * sampleRateHz);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const float w0       = 2.0f * (float)M_PI * centerHz / sampleRateHz;
+    const float cosW0    = cosf(w0);
+    const float sinW0    = sinf(w0);
+    const float Q        = centerHz / bandwidthHz;
+    const float alpha    = sinW0 / (2.0f * Q);
+
+    const float a0       = 1.0f + alpha;
+    const float invA0    = 1.0f / a0;
+
+    NotchCoeffs c;
+    c.b0 = 1.0f          * invA0;
+    c.b1 = (-2.0f * cosW0) * invA0;
+    c.b2 = 1.0f          * invA0;
+    c.a1 = (-2.0f * cosW0) * invA0;
+    c.a2 = (1.0f - alpha) * invA0;
+
+    // Install under the data mutex so the sensor task does not splice a new
+    // numerator with the old denominator in a half-applied update. Reset the
+    // per-axis state to avoid a transient pop when the response changes.
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE)
+    {
+        gyroNotchCoeffs = c;
+        memset(gyroNotchState, 0, sizeof(gyroNotchState));
+        xSemaphoreGive(dataMutex);
+    }
+    gyroNotchEnabled.store(true, std::memory_order_release);
+
+    ESP_LOGI(TAG_MPU9250, "Gyro notch enabled: f0=%.1f Hz, BW=%.1f Hz, fs=%.1f Hz (Q=%.2f)",
+             centerHz, bandwidthHz, sampleRateHz, Q);
+    return ESP_OK;
+}
+
+esp_err_t MPU9250::clearGyroNotch()
+{
+    gyroNotchEnabled.store(false, std::memory_order_release);
+    // Reset state so a future re-enable starts from a clean slate.
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE)
+    {
+        memset(gyroNotchState, 0, sizeof(gyroNotchState));
+        xSemaphoreGive(dataMutex);
+    }
+    ESP_LOGI(TAG_MPU9250, "Gyro notch disabled");
+    return ESP_OK;
 }
