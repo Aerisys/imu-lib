@@ -322,6 +322,46 @@ public:
     // This can be useful for correcting the orientation of the sensor in certain applications.
     // The method returns an ESP error code indicating the success or failure of the operation.
     esp_err_t setSwitchRollPitch(bool switchRollPitch);
+
+    // -------------------------------------------------------------------------
+    // Calibration persistence (NVS)
+    // -------------------------------------------------------------------------
+    // The consumer project is responsible for initialising NVS once at startup
+    // (`nvs_flash_init()`). The library only opens/closes a namespace.
+    //
+    // `loadCalibration()` is called automatically at the end of `init()`; if
+    // a valid blob is found, the sensor comes up already calibrated and skips
+    // the 10-second immobility window. Returns ESP_ERR_NOT_FOUND if no calib
+    // is stored, ESP_ERR_NVS_NOT_INITIALIZED if the consumer never initialised
+    // NVS, or another esp_err_t on I/O failure.
+    //
+    // `saveCalibration()` is called automatically at the end of
+    // `performCalibration()` once new offsets have been computed. You only
+    // need to call it manually after `setGyroTempCompCoeff()` if you want
+    // the new coefficient persisted without re-running a full calibration.
+    //
+    // `clearStoredCalibration()` erases the blob. Useful to force a fresh
+    // calibration on the next boot (e.g. after swapping the sensor module).
+    esp_err_t saveCalibration();
+    esp_err_t loadCalibration();
+    esp_err_t clearStoredCalibration();
+
+    // -------------------------------------------------------------------------
+    // Per-axis gyro bias temperature compensation coefficient (deg/s per degC).
+    // -------------------------------------------------------------------------
+    // Effective offset = gyroOffset + coeff * (currentTemp - gyroCalibTemp).
+    //
+    // MPU9250 gyro bias typically drifts ~0.01 deg/s per degC, with the sign
+    // and magnitude varying per chip. To measure for a specific device:
+    //   1. Calibrate cold (right after power-on, e.g. 25 degC), note bias1.
+    //   2. Let the device self-heat for several minutes, then sample raw
+    //      gyro again at ~50 degC, note bias2.
+    //   3. coeff = (bias2 - bias1) / (T2 - T1) for each axis.
+    //
+    // Default {0, 0, 0} = compensation disabled (no behaviour change). Once
+    // a coefficient is set, the next saveCalibration() persists it alongside
+    // the static offsets.
+    esp_err_t setGyroTempCompCoeff(Vector3 coeff);
 private:
     // I2C Communication
     // The `dev` handle selects which device on the bus is addressed
@@ -386,6 +426,12 @@ private:
     // Calibration
     Vector3 accelOffset;
     Vector3 gyroOffset;
+    // Temperature (degC) recorded at the moment gyroOffset was captured.
+    // Used by the runtime compensation: see `setGyroTempCompCoeff`.
+    float   gyroCalibTemp;
+    // Per-axis linear coefficient applied in the sensor task to compensate
+    // gyro bias drift with temperature. {0,0,0} = no compensation.
+    Vector3 gyroTempCompCoeff;
     Vector3 magOffset;
     Vector3 magScale;
     CalibrationStatus calibStatus;

@@ -25,4 +25,8 @@ endif()
 idf_component_register(
     SRCS ${lib_sources} ${example_sources}
     INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/include"
+    # The library uses NVS to persist calibration. Listed under REQUIRES so
+    # the new ESP-IDF v5 i2c driver and nvs_flash component are visible to
+    # both the library and any consumer of this component.
+    REQUIRES driver nvs_flash esp_timer
 )

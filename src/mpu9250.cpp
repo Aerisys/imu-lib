@@ -1,4 +1,41 @@
 #include "mpu9250.h"
+#include "nvs.h"
+
+// -----------------------------------------------------------------------------
+// Calibration persistence
+// -----------------------------------------------------------------------------
+// All offsets / scales / per-chip mag fuse values are stored as a single
+// versioned blob under the namespace below. Versioning lets us evolve the
+// layout without silently feeding garbage to a new firmware.
+//
+// The consumer project owns NVS init (`nvs_flash_init()`); this library only
+// opens/closes a namespace. If the consumer never initialised NVS, the
+// load/save paths log a warning and return ESP_ERR_NVS_NOT_INITIALIZED
+// without crashing the rest of the IMU bring-up.
+// -----------------------------------------------------------------------------
+#define MPU9250_NVS_NAMESPACE "imu_lib"
+#define MPU9250_NVS_KEY       "calib"
+#define MPU9250_CALIB_VERSION 1
+
+namespace
+{
+    struct CalibBlob
+    {
+        uint8_t version;
+        uint8_t magAvailable; // mirrors detection at calibration time
+        uint8_t padding[2];
+        float   accelOffset[3];
+        float   gyroOffset[3];
+        float   gyroCalibTemp;
+        float   gyroTempCompCoeff[3];
+        float   magOffset[3];
+        float   magScale[3];
+        uint8_t magAdjustValues[3];
+        uint8_t padding2;
+    };
+    static_assert(sizeof(CalibBlob) == 4 + 12 + 12 + 4 + 12 + 12 + 12 + 4,
+                  "CalibBlob size unexpected — review NVS layout before bumping version");
+}
 
 // I2C transaction timeout in ms used for register reads/writes.
 // Generous enough for clock stretching on slow buses; tight enough that
@@ -32,6 +69,8 @@ MPU9250::MPU9250()
       magHeading(0),
       accelOffset{0, 0, 0},
       gyroOffset{0, 0, 0},
+      gyroCalibTemp(25.0f),               // reasonable cold-start default
+      gyroTempCompCoeff{0.0f, 0.0f, 0.0f}, // {0,0,0} = compensation disabled
       magOffset{0, 0, 0},
       magScale{1.0f, 1.0f, 1.0f},
       calibStatus(NOT_CALIBRATED),
@@ -228,6 +267,24 @@ esp_err_t MPU9250::init(i2c_master_bus_handle_t bus, const Config& config)
         magAvailable = false;
         i2c_master_bus_rm_device(magDev);
         magDev = nullptr;
+    }
+
+    // Try to load a previously stored calibration. Best-effort: if NVS is not
+    // initialised by the consumer, or if no blob exists yet, we silently fall
+    // through with calibStatus == NOT_CALIBRATED. The user can then call
+    // calibrate() to produce and persist a fresh set of offsets.
+    esp_err_t loadErr = loadCalibration();
+    if (loadErr == ESP_OK)
+    {
+        ESP_LOGI(TAG_MPU9250, "Loaded calibration from NVS — skipping cold calibration");
+    }
+    else if (loadErr == ESP_ERR_NOT_FOUND)
+    {
+        ESP_LOGI(TAG_MPU9250, "No stored calibration — call calibrate() to create one");
+    }
+    else
+    {
+        ESP_LOGW(TAG_MPU9250, "loadCalibration failed (err=%d) — continuing without persisted offsets", loadErr);
     }
 
     return ESP_OK;
@@ -624,9 +681,18 @@ void MPU9250::sensorTask(void *arg)
 
             loc_temp = (temp / 333.87f) + 21.0f;
 
-            loc_gyro.x = sensor->invertAxis.x * ((gx / 32.8f) - sensor->gyroOffset.x);
-            loc_gyro.y = sensor->invertAxis.y * ((gy / 32.8f) - sensor->gyroOffset.y);
-            loc_gyro.z = sensor->invertAxis.z * ((gz / 32.8f) - sensor->gyroOffset.z);
+            // Temperature-compensated gyro offset: shift the static bias by
+            // the per-axis linear coefficient times the temperature delta vs
+            // the calibration point. coeff is {0,0,0} by default so this is
+            // a no-op until the user calls setGyroTempCompCoeff().
+            const float tempDelta = loc_temp - sensor->gyroCalibTemp;
+            const float gxOff = sensor->gyroOffset.x + sensor->gyroTempCompCoeff.x * tempDelta;
+            const float gyOff = sensor->gyroOffset.y + sensor->gyroTempCompCoeff.y * tempDelta;
+            const float gzOff = sensor->gyroOffset.z + sensor->gyroTempCompCoeff.z * tempDelta;
+
+            loc_gyro.x = sensor->invertAxis.x * ((gx / 32.8f) - gxOff);
+            loc_gyro.y = sensor->invertAxis.y * ((gy / 32.8f) - gyOff);
+            loc_gyro.z = sensor->invertAxis.z * ((gz / 32.8f) - gzOff);
 
             newDataReady = true;
         }
@@ -875,10 +941,14 @@ void MPU9250::resetCalibration()
     ESP_LOGI(TAG_MPU9250, "Resetting calibration values");
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
     {
-        accelOffset = {0, 0, 0};
-        gyroOffset = {0, 0, 0};
-        magOffset = {0, 0, 0};
-        magScale = {1.0f, 1.0f, 1.0f};
+        accelOffset      = {0, 0, 0};
+        gyroOffset       = {0, 0, 0};
+        gyroCalibTemp    = 25.0f;
+        // Note: gyroTempCompCoeff is preserved here. resetCalibration is
+        // called from calibrate() to prepare for a fresh measurement; the
+        // user-supplied temperature coefficient stays valid across re-runs.
+        magOffset        = {0, 0, 0};
+        magScale         = {1.0f, 1.0f, 1.0f};
         xSemaphoreGive(dataMutex);
         ESP_LOGI(TAG_MPU9250, "Calibration values reset");
     }
@@ -936,12 +1006,30 @@ void MPU9250::performCalibration()
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
+    // Capture the temperature at the end of the calibration window. The gyro
+    // bias drift compensation uses this as the reference point: at run-time
+    // the effective offset = gyroOffset + coeff * (currentTemp - calibTemp).
+    // Reading once here is sufficient — the chip has thermally stabilised
+    // during the 10-second still period.
+    float calibTemp = 25.0f;
+    {
+        uint8_t rawData[2] = {0};
+        if (readRegisters(mpuDev, 0x41, 2, rawData) == ESP_OK)
+        {
+            int16_t tempRaw = (((int16_t)rawData[0]) << 8) | rawData[1];
+            calibTemp = (float)tempRaw / 333.87f + 21.0f;
+        }
+    }
+
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
     {
         // Calculate average offsets
         gyroOffset.x = gyroSum.x / CALIBRATION_SAMPLES;
         gyroOffset.y = gyroSum.y / CALIBRATION_SAMPLES;
         gyroOffset.z = gyroSum.z / CALIBRATION_SAMPLES;
+        gyroCalibTemp = calibTemp;
+        // gyroTempCompCoeff is NOT touched here: a user-supplied coefficient
+        // from setGyroTempCompCoeff() is preserved across re-calibrations.
 
         // For accelerometer, Z-axis should read 1g (gravity)
         accelOffset.x = accelSum.x / CALIBRATION_SAMPLES;
@@ -979,11 +1067,22 @@ void MPU9250::performCalibration()
 
     // Log calibration results
     ESP_LOGI(TAG_MPU9250, "Accel offsets: %.3f, %.3f, %.3f", accelOffset.x, accelOffset.y, accelOffset.z);
-    ESP_LOGI(TAG_MPU9250, "Gyro offsets: %.3f, %.3f, %.3f", gyroOffset.x, gyroOffset.y, gyroOffset.z);
+    ESP_LOGI(TAG_MPU9250, "Gyro offsets:  %.3f, %.3f, %.3f (calibTemp=%.1f degC)", gyroOffset.x, gyroOffset.y, gyroOffset.z, gyroCalibTemp);
     if (magAvailable)
     {
-        ESP_LOGI(TAG_MPU9250, "Mag offsets: %.3f, %.3f, %.3f", magOffset.x, magOffset.y, magOffset.z);
-        ESP_LOGI(TAG_MPU9250, "Mag scale: %.3f, %.3f, %.3f", magScale.x, magScale.y, magScale.z);
+        ESP_LOGI(TAG_MPU9250, "Mag offsets:   %.3f, %.3f, %.3f", magOffset.x, magOffset.y, magOffset.z);
+        ESP_LOGI(TAG_MPU9250, "Mag scale:     %.3f, %.3f, %.3f", magScale.x, magScale.y, magScale.z);
+    }
+
+    // Persist so subsequent boots skip the 10-second still window.
+    esp_err_t saveErr = saveCalibration();
+    if (saveErr == ESP_OK)
+    {
+        ESP_LOGI(TAG_MPU9250, "Calibration saved to NVS");
+    }
+    else
+    {
+        ESP_LOGW(TAG_MPU9250, "saveCalibration failed (err=%d) — offsets active in RAM only", saveErr);
     }
 }
 
@@ -1113,5 +1212,129 @@ esp_err_t MPU9250::setInvertAxis(bool invertX, bool invertY, bool invertZ)
 esp_err_t MPU9250::setSwitchRollPitch(bool switchRollPitch)
 {
     this->switchRollPitch = switchRollPitch;
+    return ESP_OK;
+}
+
+// -----------------------------------------------------------------------------
+// NVS-backed calibration persistence
+// -----------------------------------------------------------------------------
+
+esp_err_t MPU9250::saveCalibration()
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(MPU9250_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG_MPU9250, "saveCalibration: nvs_open failed (%d). Did the app call nvs_flash_init()?", err);
+        return err;
+    }
+
+    CalibBlob blob = {};
+    blob.version       = MPU9250_CALIB_VERSION;
+    blob.magAvailable  = magAvailable ? 1 : 0;
+
+    // Snapshot under the data mutex so we never persist a half-written set.
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        blob.accelOffset[0] = accelOffset.x;
+        blob.accelOffset[1] = accelOffset.y;
+        blob.accelOffset[2] = accelOffset.z;
+        blob.gyroOffset[0]  = gyroOffset.x;
+        blob.gyroOffset[1]  = gyroOffset.y;
+        blob.gyroOffset[2]  = gyroOffset.z;
+        blob.gyroCalibTemp  = gyroCalibTemp;
+        blob.gyroTempCompCoeff[0] = gyroTempCompCoeff.x;
+        blob.gyroTempCompCoeff[1] = gyroTempCompCoeff.y;
+        blob.gyroTempCompCoeff[2] = gyroTempCompCoeff.z;
+        blob.magOffset[0]   = magOffset.x;
+        blob.magOffset[1]   = magOffset.y;
+        blob.magOffset[2]   = magOffset.z;
+        blob.magScale[0]    = magScale.x;
+        blob.magScale[1]    = magScale.y;
+        blob.magScale[2]    = magScale.z;
+        blob.magAdjustValues[0] = magAdjustValues[0];
+        blob.magAdjustValues[1] = magAdjustValues[1];
+        blob.magAdjustValues[2] = magAdjustValues[2];
+        xSemaphoreGive(dataMutex);
+    }
+
+    err = nvs_set_blob(handle, MPU9250_NVS_KEY, &blob, sizeof(blob));
+    if (err == ESP_OK)
+        err = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (err != ESP_OK)
+        ESP_LOGE(TAG_MPU9250, "saveCalibration: write failed (%d)", err);
+    return err;
+}
+
+esp_err_t MPU9250::loadCalibration()
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(MPU9250_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+        return ESP_ERR_NOT_FOUND; // namespace never created -> no calib
+    if (err != ESP_OK)
+        return err;
+
+    CalibBlob blob = {};
+    size_t length = sizeof(blob);
+    err = nvs_get_blob(handle, MPU9250_NVS_KEY, &blob, &length);
+    nvs_close(handle);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+        return ESP_ERR_NOT_FOUND;
+    if (err != ESP_OK)
+        return err;
+
+    if (length != sizeof(blob))
+    {
+        ESP_LOGW(TAG_MPU9250, "loadCalibration: blob size mismatch (got %u, expected %u) — ignoring", (unsigned)length, (unsigned)sizeof(blob));
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (blob.version != MPU9250_CALIB_VERSION)
+    {
+        ESP_LOGW(TAG_MPU9250, "loadCalibration: stored version %u != %u — ignoring stale blob", blob.version, MPU9250_CALIB_VERSION);
+        return ESP_ERR_INVALID_VERSION;
+    }
+
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        accelOffset       = {blob.accelOffset[0], blob.accelOffset[1], blob.accelOffset[2]};
+        gyroOffset        = {blob.gyroOffset[0],  blob.gyroOffset[1],  blob.gyroOffset[2]};
+        gyroCalibTemp     = blob.gyroCalibTemp;
+        gyroTempCompCoeff = {blob.gyroTempCompCoeff[0], blob.gyroTempCompCoeff[1], blob.gyroTempCompCoeff[2]};
+        magOffset         = {blob.magOffset[0],   blob.magOffset[1],   blob.magOffset[2]};
+        magScale          = {blob.magScale[0],    blob.magScale[1],    blob.magScale[2]};
+        // Note: magAdjustValues are read from the AK8963 fuse ROM in init(),
+        // so they will be re-loaded from hardware regardless of what we
+        // stored. The blob value is kept for diagnostic purposes only.
+        calibStatus = CALIBRATED;
+        xSemaphoreGive(dataMutex);
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t MPU9250::clearStoredCalibration()
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(MPU9250_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+        return err;
+    err = nvs_erase_key(handle, MPU9250_NVS_KEY);
+    if (err == ESP_OK)
+        err = nvs_commit(handle);
+    nvs_close(handle);
+    return (err == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : err;
+}
+
+esp_err_t MPU9250::setGyroTempCompCoeff(Vector3 coeff)
+{
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+    {
+        gyroTempCompCoeff = coeff;
+        xSemaphoreGive(dataMutex);
+    }
     return ESP_OK;
 }

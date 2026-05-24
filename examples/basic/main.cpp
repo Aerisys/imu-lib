@@ -17,9 +17,20 @@
 
 #include <mpu9250.h>
 #include "driver/i2c_master.h"
+#include "nvs_flash.h"
 
 extern "C" void app_main()
 {
+    // 0. Initialise NVS so the IMU library can persist its calibration.
+    //    Recovering from a corrupted partition by erasing it is a standard
+    //    ESP-IDF pattern — do this once at the very top of the app.
+    esp_err_t nvsErr = nvs_flash_init();
+    if (nvsErr == ESP_ERR_NVS_NO_FREE_PAGES || nvsErr == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+
     // 1. Create the I2C bus once for the whole application.
     //
     //    The bus itself has no clock — each device handle sets its own SCL
@@ -63,13 +74,23 @@ extern "C" void app_main()
     imu.setSwitchRollPitch(true);
     ESP_LOGI("APP", "MPU9250 initialized");
 
-    err = imu.calibrate();
-    if (err != ESP_OK)
+    // Calibration is auto-loaded from NVS by init(). Only run a fresh
+    // calibration if nothing was found on disk — otherwise we'd uselessly
+    // burn 10 s of immobility on every boot.
+    if (imu.getCalibrationStatus() != MPU9250::CALIBRATED)
     {
-        ESP_LOGE("APP", "Failed to start calibration");
-        return;
+        err = imu.calibrate();
+        if (err != ESP_OK)
+        {
+            ESP_LOGE("APP", "Failed to start calibration");
+            return;
+        }
+        ESP_LOGI("APP", "Calibration started (will be persisted to NVS on completion)");
     }
-    ESP_LOGI("APP", "Calibration started");
+    else
+    {
+        ESP_LOGI("APP", "Calibration loaded from NVS, skipping cold calibration");
+    }
 
     imu.setFilterMode(MPU9250::MAHONY);
     // Optional: tune Mahony gains for this airframe.
