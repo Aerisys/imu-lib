@@ -84,10 +84,15 @@ MPU9250::MPU9250()
       // Explicit default for switchRollPitch: previously left uninitialised,
       // which read as garbage on the first processMeasurements() call before
       // setSwitchRollPitch() was invoked by the user.
-      switchRollPitch(false)
+      switchRollPitch(false),
+      publishedBundle{},
+      bundleSeq(0)
 {
     memset(magAdjustValues, 0, sizeof(magAdjustValues));
     dataMutex = xSemaphoreCreateMutex();
+    // Binary semaphore is created "empty" — first waitForNewSample() blocks
+    // until the sensor task gives it after the first publish.
+    sampleSem = xSemaphoreCreateBinary();
 }
 
 MPU9250::~MPU9250()
@@ -127,6 +132,16 @@ MPU9250::~MPU9250()
     {
         vSemaphoreDelete(dataMutex);
         dataMutex = nullptr;
+    }
+    if (sampleSem != nullptr)
+    {
+        // Best-effort: wake any blocked consumer before destroying the
+        // semaphore so it exits waitForNewSample() rather than blocking on
+        // a freed handle. The consumer is expected to be stopped by this
+        // point — this is just a safety net.
+        xSemaphoreGive(sampleSem);
+        vSemaphoreDelete(sampleSem);
+        sampleSem = nullptr;
     }
 }
 
@@ -760,6 +775,39 @@ void MPU9250::sensorTask(void *arg)
 
                 xSemaphoreGive(sensor->dataMutex);
             }
+
+            // -----------------------------------------------------------------
+            // Atomic publish via seqlock + new-sample signal.
+            //
+            // We do this OUTSIDE the dataMutex on purpose:
+            //   - The reader path (getSnapshot) never takes dataMutex; it
+            //     loops on bundleSeq instead, so mutex contention against
+            //     the reader is zero.
+            //   - The seqlock writer protocol guarantees readers either
+            //     copy the previous coherent bundle or the new one — never
+            //     a half-written mix.
+            //   - The semaphore give is a single FreeRTOS call (~few us);
+            //     no need to hold any lock around it.
+            // -----------------------------------------------------------------
+            // Step 1: bump seq to odd -> readers know "writer in progress"
+            uint32_t s = sensor->bundleSeq.load(std::memory_order_relaxed);
+            sensor->bundleSeq.store(s + 1, std::memory_order_release);
+
+            // Step 2: write the bundle (small, takes well under 1 us)
+            sensor->publishedBundle.accel       = sensor->accel;
+            sensor->publishedBundle.gyro        = sensor->gyro;
+            sensor->publishedBundle.mag         = sensor->mag;
+            sensor->publishedBundle.orientation = sensor->orientation;
+            sensor->publishedBundle.quaternion  = sensor->q;
+            sensor->publishedBundle.temperature = sensor->temperature;
+            sensor->publishedBundle.timestampUs = (uint64_t)now;
+
+            // Step 3: bump seq to even -> readers know the bundle is coherent
+            sensor->bundleSeq.store(s + 2, std::memory_order_release);
+
+            // Step 4: wake any task blocked in waitForNewSample(). Binary
+            // sem: if the consumer hasn't taken yet, this is a no-op.
+            xSemaphoreGive(sensor->sampleSem);
         }
 
 #if MPU9250_PROFILER
@@ -1086,48 +1134,31 @@ void MPU9250::performCalibration()
     }
 }
 
+// Individual getters now go through the lock-free snapshot path so the
+// consumer never blocks on dataMutex (which the sensor task holds during
+// the I2C burst + math, up to ~800 us). The trade-off is a small constant
+// cost per call: each one copies the whole bundle even though the consumer
+// only needs one field. If the consumer reads several fields, prefer
+// `getSnapshot()` directly to do a single seqlock read.
+
 MPU9250::Orientation MPU9250::getOrientation()
 {
-    Orientation result;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-    {
-        result = orientation;
-        xSemaphoreGive(dataMutex);
-    }
-    return result;
+    return getSnapshot().orientation;
 }
 
 MPU9250::Vector3 MPU9250::getAccel()
 {
-    Vector3 result;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-    {
-        result = accel;
-        xSemaphoreGive(dataMutex);
-    }
-    return result;
+    return getSnapshot().accel;
 }
 
 MPU9250::Vector3 MPU9250::getGyro()
 {
-    Vector3 result;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-    {
-        result = gyro;
-        xSemaphoreGive(dataMutex);
-    }
-    return result;
+    return getSnapshot().gyro;
 }
 
 MPU9250::Vector3 MPU9250::getMag()
 {
-    Vector3 result;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-    {
-        result = mag;
-        xSemaphoreGive(dataMutex);
-    }
-    return result;
+    return getSnapshot().mag;
 }
 
 MPU9250::Quaternion MPU9250::getQuaternion()
@@ -1135,13 +1166,7 @@ MPU9250::Quaternion MPU9250::getQuaternion()
     // Returned in body-to-world convention. Always a unit quaternion as long
     // as the Mahony path has run at least once since boot; otherwise it is
     // the identity {1,0,0,0} initialised by the constructor.
-    Quaternion result{1.0f, 0.0f, 0.0f, 0.0f};
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-    {
-        result = q;
-        xSemaphoreGive(dataMutex);
-    }
-    return result;
+    return getSnapshot().quaternion;
 }
 
 esp_err_t MPU9250::setMahonyGains(float kp, float ki)
@@ -1168,13 +1193,7 @@ esp_err_t MPU9250::setMahonyGains(float kp, float ki)
 
 float MPU9250::getTemperature()
 {
-    float result = 0;
-    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-    {
-        result = temperature;
-        xSemaphoreGive(dataMutex);
-    }
-    return result;
+    return getSnapshot().temperature;
 }
 
 bool MPU9250::isSensorHealthy()
@@ -1337,4 +1356,50 @@ esp_err_t MPU9250::setGyroTempCompCoeff(Vector3 coeff)
         xSemaphoreGive(dataMutex);
     }
     return ESP_OK;
+}
+
+// -----------------------------------------------------------------------------
+// Lock-free snapshot + sample signalling
+// -----------------------------------------------------------------------------
+
+MPU9250::SampleBundle MPU9250::getSnapshot()
+{
+    // Seqlock read protocol:
+    //   1. Load seq. If odd, writer is mid-publish: retry.
+    //   2. Copy the bundle.
+    //   3. Load seq again. If it changed, our copy was sliced: retry.
+    //
+    // Worst-case bound: writer cycle is 1 ms and writes the bundle in <1 us,
+    // so the retry window per iteration is tiny. taskYIELD() between
+    // attempts so we don't starve the writer if it happens to be on the
+    // same core at a lower priority.
+    SampleBundle local;
+    uint32_t s1, s2;
+    do
+    {
+        s1 = bundleSeq.load(std::memory_order_acquire);
+        if (s1 & 1u)
+        {
+            // Writer in progress — yield and retry.
+            taskYIELD();
+            continue;
+        }
+        local = publishedBundle;
+        s2 = bundleSeq.load(std::memory_order_acquire);
+    } while (s1 != s2);
+    return local;
+}
+
+esp_err_t MPU9250::waitForNewSample(uint32_t timeoutMs)
+{
+    if (sampleSem == nullptr)
+        return ESP_ERR_INVALID_STATE;
+
+    // Binary semaphore: returns immediately if a sample has been published
+    // since the last take (or this is the first call), otherwise blocks up
+    // to timeoutMs. xSemaphoreTake -> pdTRUE on signal, pdFALSE on timeout.
+    const TickType_t ticks = (timeoutMs == 0)
+                                 ? portMAX_DELAY
+                                 : pdMS_TO_TICKS(timeoutMs);
+    return (xSemaphoreTake(sampleSem, ticks) == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
