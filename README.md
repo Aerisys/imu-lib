@@ -18,7 +18,9 @@ Drivers I²C, calibration persistée NVS, filtre Mahony 9-DOF avec quaternion, l
 | **Synchro consommateur** | `waitForNewSample()` (binary sem) + `getSnapshot()` (seqlock atomique) → PID drone **timé par le capteur**, plus de phase drift. |
 | **Notch filter** | Biquad IIR par axe gyro configurable runtime pour supprimer la fondamentale moteur (vibrations). |
 | **Architecture** | Interface abstraite `IMUSensor` → MPU6050 / MPU9250 / ICM-* futurs interchangeables polymorphiquement. |
-| **Persistance** | Offsets accel/gyro/mag + coeff T° dans NVS (blob versionné). Skip de la calibration à chaque boot. |
+| **Persistance** | Offsets accel/gyro/mag + coeff T° + home offset dans NVS (blob versionné). Skip de la calibration à chaque boot. |
+| **Home / mount-offset** *(v1.2.0)* | `setHome()` capture la position courante comme "level chassis". Offset quaternion appliqué uniquement sur **roll/pitch**, le yaw reste absolu (mag heading préservé). Persisté NVS. |
+| **Mahony fast-init boost** *(v1.2.0)* | Kp boosté à 10 (par défaut) pendant 3 s (configurable) au boot et après `calibrateGyroAccel` → convergence du filtre en < 1 s au lieu de 5-10 s avec gyro bias résiduel. Disable via `Config::mahonyBoostDurationMs = 0`. |
 
 ---
 
@@ -251,7 +253,43 @@ class MPU9250 : public IMUSensor {
     esp_err_t saveCalibration();
     esp_err_t loadCalibration();
     esp_err_t clearStoredCalibration();
+
+    // Home / mount-offset (v1.2.0) — captures la position courante comme
+    // "level chassis". Offset quaternion appliqué uniquement sur roll/pitch,
+    // le yaw reste absolu. Persisté NVS, requiert filterMode = MAHONY.
+    esp_err_t setHome();
+    esp_err_t clearHome();
+    bool      isHomeSet() const;
+    // Bypass de l'offset (rare — debug ou besoin du frame IMU brut)
+    Orientation getAbsoluteOrientation();
+    Quaternion  getAbsoluteQuaternion();
+
+    // Mahony fast-init boost (v1.2.0) — Kp boosté pendant N ms au boot
+    // (et après calibrateGyroAccel) pour accélérer la convergence du
+    // filtre. Auto-trigger en interne ; appel manuel utile après un
+    // disturbance majeur (atterrissage brutal, collision).
+    esp_err_t setMahonyBoost(float boostKp, uint32_t durationMs);
+    esp_err_t triggerMahonyBoost();
 };
+```
+
+**Usage typique du home offset** :
+
+```cpp
+// 1. Poser le drone dans la position que tu considères "level chassis"
+//    (sur surface plate, ou avec un niveau à bulle).
+// 2. Une fois Mahony convergé (~2 s après le boot) :
+imu->setHome();
+//    -> roll/pitch reportés = 0 dans cette position
+//    -> yaw reste à la valeur courante (= mag heading absolu)
+//    -> automatiquement persisté en NVS, conservé à travers les reboots
+
+// Si tu changes la mécanique du drone (nouveau montage IMU, autre frame) :
+imu->clearHome();
+//    -> retour à l'orientation IMU brute, persisté
+
+// Pour récupérer l'orientation IMU brute (rare, p.ex. debug) :
+auto raw = imu->getAbsoluteOrientation();
 ```
 
 ---

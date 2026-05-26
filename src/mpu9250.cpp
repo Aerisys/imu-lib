@@ -15,15 +15,21 @@
 // -----------------------------------------------------------------------------
 #define MPU9250_NVS_NAMESPACE "imu_lib"
 #define MPU9250_NVS_KEY       "calib"
-#define MPU9250_CALIB_VERSION 1
+// v2 ajoute qHomeInverse + homeIsSet (cf. setHome / clearHome).
+// Les blobs v1 plus anciens sont rejetés au load (force recalibration).
+#define MPU9250_CALIB_VERSION 3
 
 namespace
 {
+    // v2 layout. v1 (sans qHomeInverse) est rejeté au load -> force
+    // recalibration. Pour bumper à v3, étendre ici puis incrémenter
+    // MPU9250_CALIB_VERSION et le static_assert.
     struct CalibBlob
     {
         uint8_t version;
         uint8_t magAvailable; // mirrors detection at calibration time
-        uint8_t padding[2];
+        uint8_t homeIsSet;    // v2: 0/1 — drives whether qHomeInverse is applied
+        uint8_t padding;
         float   accelOffset[3];
         float   gyroOffset[3];
         float   gyroCalibTemp;
@@ -32,9 +38,34 @@ namespace
         float   magScale[3];
         uint8_t magAdjustValues[3];
         uint8_t padding2;
+        float   qHomeInverse[4]; // v2: roll/pitch-only mount offset (conjugated)
     };
-    static_assert(sizeof(CalibBlob) == 4 + 12 + 12 + 4 + 12 + 12 + 12 + 4,
+    static_assert(sizeof(CalibBlob) == 4 + 12 + 12 + 4 + 12 + 12 + 12 + 4 + 16,
                   "CalibBlob size unexpected — review NVS layout before bumping version");
+
+    // Conversion Quaternion -> Euler (Degrés)
+    inline IMUSensor::Orientation quatToEuler(const IMUSensor::Quaternion& q, bool switchRollPitch)
+    {
+        IMUSensor::Orientation euler;
+        if (switchRollPitch)
+        {
+            euler.pitch = atan2f(2.0f*(q.w*q.x + q.y*q.z), 1.0f - 2.0f*(q.x*q.x + q.y*q.y)) * RAD_TO_DEG;
+            euler.roll  = asinf( 2.0f*(q.w*q.y - q.z*q.x)) * RAD_TO_DEG;
+        } 
+        else 
+        {
+            euler.roll  = atan2f(2.0f*(q.w*q.x + q.y*q.z), 1.0f - 2.0f*(q.x*q.x + q.y*q.y)) * RAD_TO_DEG;
+            euler.pitch = asinf( 2.0f*(q.w*q.y - q.z*q.x)) * RAD_TO_DEG;
+        }
+
+        euler.yaw = atan2f(2.0f*(q.w*q.z + q.x*q.y), 1.0f - 2.0f*(q.y*q.y + q.z*q.z)) * RAD_TO_DEG;
+
+        // Normalisation [0, 360)
+        if (euler.yaw < 0.0f) euler.yaw += 360.0f;
+        else if (euler.yaw >= 360.0f) euler.yaw -= 360.0f;
+
+        return euler;
+    }
 }
 
 // I2C transaction timeout in ms used for register reads/writes.
@@ -50,6 +81,33 @@ namespace
 #ifndef MPU9250_PROFILER
 #define MPU9250_PROFILER 0
 #endif
+
+// -----------------------------------------------------------------------------
+// File-local quaternion helpers (used by setHome / Mahony output composition).
+// Kept here to avoid polluting the public Quaternion type in imu_sensor.h with
+// member operators that not every consumer needs.
+// -----------------------------------------------------------------------------
+namespace
+{
+    using Q = IMUSensor::Quaternion;
+
+    // Hamilton product: r = a * b
+    inline Q quatMul(const Q& a, const Q& b)
+    {
+        return {
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w
+        };
+    }
+
+    // Conjugate (= inverse for unit quaternion): q* = (w, -x, -y, -z)
+    inline Q quatConj(const Q& q)
+    {
+        return { q.w, -q.x, -q.y, -q.z };
+    }
+}
 
 // Implementation
 MPU9250::MPU9250()
@@ -89,6 +147,11 @@ MPU9250::MPU9250()
       q{1.0f, 0.0f, 0.0f, 0.0f}, // Identity quaternion (no rotation)
       mahonyKp(MAHONY_KP),
       mahonyKi(MAHONY_KI),
+      mahonyBoostKp(10.0f),
+      mahonyBoostDurationMs(3000),
+      mahonyBoostUntilUs(0),               // 0 = boost not currently active
+      qHomeInverse{1.0f, 0.0f, 0.0f, 0.0f}, // identity = no offset
+      homeIsSet(false),
       switchRollPitch(false)
 {
     memset(magAdjustValues, 0, sizeof(magAdjustValues));
@@ -157,11 +220,13 @@ esp_err_t MPU9250::init(i2c_master_bus_handle_t bus, const Config& config)
         return ESP_ERR_INVALID_ARG;
     }
 
-    busHandle     = bus;
-    intPin        = config.intPin;
-    taskCoreId    = config.taskCoreId;
-    taskPriority  = config.taskPriority;
-    taskStackSize = config.taskStackSize;
+    busHandle             = bus;
+    intPin                = config.intPin;
+    taskCoreId            = config.taskCoreId;
+    taskPriority          = config.taskPriority;
+    taskStackSize         = config.taskStackSize;
+    mahonyBoostKp         = config.mahonyBoostKp;
+    mahonyBoostDurationMs = config.mahonyBoostDurationMs;
 
     // Attach the MPU9250 itself as a device on the bus.
     i2c_device_config_t mpuCfg = {};
@@ -596,9 +661,23 @@ void MPU9250::updateMahonyFilter(float dt)
     }
 
     // -- Proportional feedback -------------------------------------------------
-    gx += mahonyKp * ex;
-    gy += mahonyKp * ey;
-    gz += mahonyKp * ez;
+    // Fast-init boost: temporarily raise Kp at boot (and after
+    // calibrateGyroAccel) so the filter converges from identity to the
+    // actual attitude in well under 1 s instead of the 5-10 s observed
+    // with nominal Kp + any residual gyro bias.
+    float effectiveKp = mahonyKp;
+    if (mahonyBoostUntilUs > 0) {
+        if (esp_timer_get_time() < mahonyBoostUntilUs) {
+            effectiveKp = mahonyBoostKp;
+        } else {
+            mahonyBoostUntilUs = 0;
+            ESP_LOGI(TAG_MPU9250, "Mahony boost ended, Kp restored to %.2f", mahonyKp);
+        }
+    }
+
+    gx += effectiveKp * ex;
+    gy += effectiveKp * ey;
+    gz += effectiveKp * ez;
 
     // -- Integrate quaternion derivative ---------------------------------------
     float half_dt = 0.5f * dt;
@@ -622,20 +701,7 @@ void MPU9250::updateMahonyFilter(float dt)
     q.z = q3 * invQNorm;
 
     // Convert quaternion to Euler angles (deg)
-    if (switchRollPitch)
-    {
-        orientation.pitch  = atan2f(2.0f*(q.w*q.x + q.y*q.z), 1.0f - 2.0f*(q.x*q.x + q.y*q.y)) * RAD_TO_DEG;
-        orientation.roll = asinf( 2.0f*(q.w*q.y - q.z*q.x)) * RAD_TO_DEG;
-    } else {
-        orientation.roll  = atan2f(2.0f*(q.w*q.x + q.y*q.z), 1.0f - 2.0f*(q.x*q.x + q.y*q.y)) * RAD_TO_DEG;
-        orientation.pitch = asinf( 2.0f*(q.w*q.y - q.z*q.x)) * RAD_TO_DEG;
-    }
-    
-    orientation.yaw   = atan2f(2.0f*(q.w*q.z + q.x*q.y), 1.0f - 2.0f*(q.y*q.y + q.z*q.z)) * RAD_TO_DEG;
-
-    // Keep yaw in [0,360)
-    if (orientation.yaw < 0) orientation.yaw += 360.0f;
-    else if (orientation.yaw >= 360.0f) orientation.yaw -= 360.0f;
+    orientation = quatToEuler(q, switchRollPitch);
 }
 
 void MPU9250::processMeasurements(float dt)
@@ -872,10 +938,22 @@ void MPU9250::sensorTask(void *arg)
             sensor->publishedBundle.accel       = sensor->accel;
             sensor->publishedBundle.gyro        = sensor->gyro;
             sensor->publishedBundle.mag         = sensor->mag;
-            sensor->publishedBundle.orientation = sensor->orientation;
-            sensor->publishedBundle.quaternion  = sensor->q;
             sensor->publishedBundle.temperature = sensor->temperature;
             sensor->publishedBundle.timestampUs = (uint64_t)now;
+
+            if (sensor->homeIsSet)
+            {
+                // q_publié = q_brut * q_offset
+                Quaternion qPub = quatMul(sensor->q, sensor->qHomeInverse);
+                sensor->publishedBundle.quaternion  = qPub;
+                sensor->publishedBundle.orientation = quatToEuler(qPub, sensor->switchRollPitch);
+            }
+            else
+            {
+                // Pas d'offset, on publie les valeurs brutes
+                sensor->publishedBundle.quaternion  = sensor->q;
+                sensor->publishedBundle.orientation = sensor->orientation;
+            }
 
             // Step 3: bump seq to even -> readers know the bundle is coherent
             sensor->bundleSeq.store(s + 2, std::memory_order_release);
@@ -1030,6 +1108,11 @@ esp_err_t MPU9250::startSensorTask()
     {
         ESP_LOGW(TAG_MPU9250, "No INT pin configured — falling back to polling (~100 Hz)");
     }
+
+    // Auto-trigger the Mahony fast-init boost so the filter converges from
+    // identity to the actual attitude in well under 1 s. No-op if
+    // mahonyBoostDurationMs == 0 (boost disabled).
+    triggerMahonyBoost();
 
     return ESP_OK;
 }
@@ -1207,6 +1290,11 @@ void MPU9250::performGyroAccelCalibration()
     ESP_LOGI(TAG_MPU9250, "  Gyro offsets:  %.3f, %.3f, %.3f (calibTemp=%.1f degC)",
              gyroOffset.x, gyroOffset.y, gyroOffset.z, gyroCalibTemp);
 
+    // Re-arm the Mahony fast-init boost: the new gyro/accel offsets have
+    // shifted the filter's expected gravity reference, so a brief high-Kp
+    // window helps the orientation estimate re-converge without lag.
+    triggerMahonyBoost();
+
     esp_err_t saveErr = saveCalibration();
     if (saveErr != ESP_OK)
         ESP_LOGW(TAG_MPU9250, "saveCalibration failed (err=%d) — RAM-only", saveErr);
@@ -1349,6 +1437,43 @@ esp_err_t MPU9250::setMahonyGains(float kp, float ki)
     return ESP_OK;
 }
 
+esp_err_t MPU9250::setMahonyBoost(float boostKp, uint32_t durationMs)
+{
+    if (boostKp < 0.0f)
+    {
+        ESP_LOGE(TAG_MPU9250, "setMahonyBoost: boostKp must be non-negative");
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Clamp boostKp to >= nominal mahonyKp (boosting downward makes no sense).
+    if (boostKp < mahonyKp)
+        boostKp = mahonyKp;
+
+    // 4-byte aligned float / uint32 stores are atomic on ESP32 — no mutex.
+    mahonyBoostKp         = boostKp;
+    mahonyBoostDurationMs = durationMs;
+
+    ESP_LOGI(TAG_MPU9250, "Mahony boost configured: Kp=%.2f for %u ms",
+             boostKp, (unsigned)durationMs);
+    return ESP_OK;
+}
+
+esp_err_t MPU9250::triggerMahonyBoost()
+{
+    if (mahonyBoostDurationMs == 0)
+    {
+        // Boost disabled — silent no-op so callers (startSensorTask,
+        // performGyroAccelCalibration) can always invoke without
+        // conditioning on Config.
+        return ESP_OK;
+    }
+    // Arm the boost window: effective Kp = mahonyBoostKp until this deadline.
+    mahonyBoostUntilUs = esp_timer_get_time()
+                       + (int64_t)mahonyBoostDurationMs * 1000;
+    ESP_LOGI(TAG_MPU9250, "Mahony boost armed: Kp=%.2f for %u ms",
+             mahonyBoostKp, (unsigned)mahonyBoostDurationMs);
+    return ESP_OK;
+}
+
 float MPU9250::getTemperature()
 {
     return getSnapshot().temperature;
@@ -1432,6 +1557,12 @@ esp_err_t MPU9250::saveCalibration()
         blob.magAdjustValues[0] = magAdjustValues[0];
         blob.magAdjustValues[1] = magAdjustValues[1];
         blob.magAdjustValues[2] = magAdjustValues[2];
+        // v2: home offset (mount tilt compensation, roll/pitch only).
+        blob.homeIsSet = homeIsSet ? 1 : 0;
+        blob.qHomeInverse[0] = qHomeInverse.w;
+        blob.qHomeInverse[1] = qHomeInverse.x;
+        blob.qHomeInverse[2] = qHomeInverse.y;
+        blob.qHomeInverse[3] = qHomeInverse.z;
         xSemaphoreGive(dataMutex);
     }
 
@@ -1486,6 +1617,21 @@ esp_err_t MPU9250::loadCalibration()
         // Note: magAdjustValues are read from the AK8963 fuse ROM in init(),
         // so they will be re-loaded from hardware regardless of what we
         // stored. The blob value is kept for diagnostic purposes only.
+        // v2: home offset (mount tilt compensation). If the blob has a
+        // home set, apply it; otherwise stay at identity (no compensation).
+        homeIsSet    = (blob.homeIsSet != 0);
+        qHomeInverse = { blob.qHomeInverse[0], blob.qHomeInverse[1],
+                         blob.qHomeInverse[2], blob.qHomeInverse[3] };
+        // Safety: if the stored quaternion is garbage (e.g. all zeros from
+        // a botched first save), fall back to identity rather than wreck
+        // the orientation output.
+        const float qn = qHomeInverse.w * qHomeInverse.w + qHomeInverse.x * qHomeInverse.x
+                       + qHomeInverse.y * qHomeInverse.y + qHomeInverse.z * qHomeInverse.z;
+        if (qn < 0.5f || qn > 1.5f) {
+            ESP_LOGW(TAG_MPU9250, "loadCalibration: invalid qHomeInverse (norm^2=%.3f), falling back to identity", qn);
+            qHomeInverse = { 1.0f, 0.0f, 0.0f, 0.0f };
+            homeIsSet    = false;
+        }
         calibStatus = CALIBRATED;
         xSemaphoreGive(dataMutex);
     }
@@ -1639,4 +1785,73 @@ esp_err_t MPU9250::clearGyroNotch()
     }
     ESP_LOGI(TAG_MPU9250, "Gyro notch disabled");
     return ESP_OK;
+}
+
+esp_err_t MPU9250::setHome()
+{
+    // Le setHome dépend du quaternion absolu maintenu par le filtre de Mahony
+    if (filterMode != MAHONY)
+    {
+        ESP_LOGE(TAG_MPU9250, "setHome requires MAHONY filter mode to be active");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        // 1. Récupération du cap (yaw) actuel en radians
+        float yawRad = orientation.yaw * DEG_TO_RAD;
+
+        // 2. Création d'un quaternion de lacet pur représentant l'attitude "à plat" idéale
+        float halfYaw = yawRad * 0.5f;
+        Quaternion qYaw = { cosf(halfYaw), 0.0f, 0.0f, sinf(halfYaw) };
+
+        // 3. Calcul de l'offset : qHomeInverse = (q_brut)* * q_yaw
+        qHomeInverse = quatMul(quatConj(q), qYaw);
+        homeIsSet = true;
+
+        xSemaphoreGive(dataMutex);
+
+        ESP_LOGI(TAG_MPU9250, "Home set successfully. Yaw preserved at %.1f deg", orientation.yaw);
+        
+        // Sauvegarde automatique en NVS
+        return saveCalibration();
+    }
+    
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t MPU9250::clearHome()
+{
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        qHomeInverse = {1.0f, 0.0f, 0.0f, 0.0f}; // Identité
+        homeIsSet = false;
+        xSemaphoreGive(dataMutex);
+
+        ESP_LOGI(TAG_MPU9250, "Home offset cleared");
+        
+        // Sauvegarde automatique en NVS
+        return saveCalibration();
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+MPU9250::Quaternion MPU9250::getAbsoluteQuaternion()
+{
+    SampleBundle bundle = getSnapshot();
+    
+    // Si un home est défini, le bundle contient le quaternion corrigé (q_pub).
+    // Pour retrouver l'original : q_brut = q_pub * (qHomeInverse)*
+    if (homeIsSet)
+    {
+        return quatMul(bundle.quaternion, quatConj(qHomeInverse));
+    }
+    
+    return bundle.quaternion;
+}
+
+MPU9250::Orientation MPU9250::getAbsoluteOrientation()
+{
+    // On réutilise la conversion d'Euler sur le quaternion absolu
+    return quatToEuler(getAbsoluteQuaternion(), switchRollPitch);
 }

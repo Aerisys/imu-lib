@@ -175,11 +175,24 @@ public:
         UBaseType_t taskPriority  = 5;
         uint32_t    taskStackSize = 4096;
 
+        // Mahony fast-init boost. At boot (and after calibrateGyroAccel),
+        // the Mahony Kp is temporarily raised to `mahonyBoostKp` for
+        // `mahonyBoostDurationMs` to accelerate convergence from identity
+        // quaternion to the actual attitude (otherwise ~5-10 s at nominal
+        // Kp=1.0, especially if any residual gyro bias is fighting the
+        // correction). After the boost window, Kp drops back to the value
+        // set via `setMahonyGains` (default MAHONY_KP).
+        //   - boostKp must be >= nominal Kp to make sense (clamped otherwise)
+        //   - durationMs == 0 disables the boost entirely
+        float       mahonyBoostKp         = 10.0f;
+        uint32_t    mahonyBoostDurationMs = 3000;
+
         Config()
             : mpuAddr(0x68), magAddr(0x0C), sclSpeedHz(400000),
               intPin(GPIO_NUM_NC),
               taskCoreId(tskNO_AFFINITY), taskPriority(5),
-              taskStackSize(4096)
+              taskStackSize(4096),
+              mahonyBoostKp(10.0f), mahonyBoostDurationMs(3000)
         {}
     };
 
@@ -307,6 +320,20 @@ public:
     // Returns ESP_OK on success, ESP_ERR_INVALID_ARG on negative gains.
     esp_err_t setMahonyGains(float kp, float ki);
 
+    // Configure the Mahony fast-init boost (auto-triggered at boot of the
+    // sensor task and after `calibrateGyroAccel`). Default boostKp=10,
+    // durationMs=3000 (cf. `Config::mahonyBoost*`). Set `durationMs=0` to
+    // disable the boost entirely. Negative gains are rejected; a boostKp
+    // lower than the nominal mahonyKp is silently clamped to mahonyKp
+    // (no point boosting downward).
+    esp_err_t setMahonyBoost(float boostKp, uint32_t durationMs);
+
+    // Re-arm the Mahony boost period right now (starts a new boost window
+    // of the currently configured duration). Useful after a large
+    // disturbance (hard landing, collision, manual handling) to force the
+    // filter to re-converge quickly. No-op if `mahonyBoostDurationMs == 0`.
+    esp_err_t triggerMahonyBoost();
+
     // The `getTemperature` method retrieves the current temperature reading from the sensor.
     // It returns the temperature in degrees Celsius.
     // The temperature is measured by the internal temperature sensor of the MPU9250.
@@ -420,6 +447,43 @@ public:
     // a coefficient is set, the next saveCalibration() persists it alongside
     // the static offsets.
     esp_err_t setGyroTempCompCoeff(Vector3 coeff);
+
+    // -------------------------------------------------------------------------
+    // Home / mount-offset compensation (quaternion, roll/pitch only)
+    // -------------------------------------------------------------------------
+    // When the IMU PCB is not perfectly perpendicular to the chassis, the
+    // Mahony estimate reports the IMU tilt instead of the chassis tilt.
+    // `setHome()` captures the CURRENT attitude as the chassis "level"
+    // reference, then transparently applies a quaternion offset to all
+    // subsequent `getOrientation()` / `getQuaternion()` / `getSnapshot()`
+    // results so they report the chassis frame instead of the raw IMU frame.
+    //
+    // Convention: ONLY the roll/pitch components of the offset are captured.
+    // Yaw stays absolute (magnetic heading), which is what flight control
+    // and GPS modules typically want.
+    //
+    // Usage:
+    //   1. Place the drone in the "neutral / level" attitude on a flat surface.
+    //   2. Call `imu->setHome();` (typically once at first boot, persists in NVS).
+    //   3. All future calls to getOrientation/getQuaternion report chassis frame.
+    //
+    // Auto-persisted to NVS alongside the rest of the calibration blob.
+    // Returns ESP_OK on success.
+    esp_err_t setHome();
+
+    // Drop the home offset (return to raw absolute IMU orientation).
+    // Persists the cleared state to NVS.
+    esp_err_t clearHome();
+
+    // True if a non-identity home offset is currently applied.
+    bool isHomeSet() const { return homeIsSet; }
+
+    // Raw IMU-frame orientation / quaternion — bypasses the home offset.
+    // Useful for debugging the mount offset itself, or for sub-modules that
+    // need the absolute IMU attitude (rare). Most consumers should keep
+    // using getOrientation() / getQuaternion(), which apply the offset.
+    Orientation getAbsoluteOrientation();
+    Quaternion  getAbsoluteQuaternion();
 private:
     // I2C Communication
     // The `dev` handle selects which device on the bus is addressed
@@ -545,6 +609,22 @@ private:
     // top of this header; can be retuned at runtime via setMahonyGains().
     float mahonyKp;
     float mahonyKi;
+
+    // Fast-init boost (cf. setMahonyBoost public API).
+    //   - mahonyBoostKp        : Kp value used during the boost window
+    //   - mahonyBoostDurationMs: width of the boost window in ms
+    //   - mahonyBoostUntilUs   : esp_timer_get_time() target until which
+    //                            the boost Kp applies (0 = boost inactive)
+    float    mahonyBoostKp;
+    uint32_t mahonyBoostDurationMs;
+    int64_t  mahonyBoostUntilUs;
+
+    // Home / mount-offset (cf. setHome/clearHome public API).
+    // qHomeInverse encodes the conjugate of the roll/pitch-only quaternion
+    // captured at setHome time. Applied as `q * qHomeInverse` before Euler
+    // conversion. Identity (1,0,0,0) when no home is set.
+    Quaternion qHomeInverse;
+    bool       homeIsSet;
 
     // Inverted axis
     struct InvertAxis

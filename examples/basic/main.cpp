@@ -172,8 +172,8 @@ extern "C" void app_main()
                      s.quaternion.w, s.quaternion.x, s.quaternion.y, s.quaternion.z,
                      s.gyro.x, s.gyro.y, s.gyro.z,
                      s.temperature);
-            // ESP_LOGI("APP", "roll=%.1f pitch=%.1f yaw=%.1f", 
-            //     s.orientation.roll, s.orientation.pitch, s.orientation.yaw);
+            ESP_LOGI("APP", "roll=%.1f pitch=%.1f yaw=%.1f", 
+                s.orientation.roll, s.orientation.pitch, s.orientation.yaw);
         }
     }
 }
