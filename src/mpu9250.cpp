@@ -17,7 +17,7 @@
 #define MPU9250_NVS_KEY       "calib"
 // v2 ajoute qHomeInverse + homeIsSet (cf. setHome / clearHome).
 // Les blobs v1 plus anciens sont rejetés au load (force recalibration).
-#define MPU9250_CALIB_VERSION 3
+#define MPU9250_CALIB_VERSION 4
 
 namespace
 {
